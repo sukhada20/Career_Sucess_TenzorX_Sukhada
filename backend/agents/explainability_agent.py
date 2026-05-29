@@ -4,9 +4,8 @@ Explainability Agent.
 Converts SHAP values + cohort stats into human-readable risk narratives.
 Replaces hardcoded NLG template strings.
 """
-import json
 from base_agent import run_agent
-from tools import TOOL_DEFINITIONS
+from tools import execute_tool
 
 EXPLAIN_SYSTEM_PROMPT = """
 You are the Explainability Agent for PlacementIQ — an AI risk system for education loans.
@@ -22,10 +21,10 @@ WRITING RULES (strictly follow):
 - If risk is HIGH, end with ONE urgent action sentence
 - If data gaps limit confidence, mention it once at the end
 
-TOOL USAGE:
-1. Call get_shap_drivers to get the actual feature attributions
-2. Call get_peer_cohort_stats to get the cohort benchmark for comparison
-3. Write the narrative using both
+INPUTS YOU WILL RECEIVE:
+1. SHAP driver attributions for THIS student
+2. Cohort benchmark statistics
+Use BOTH when writing the narrative — every comparison must cite the cohort number.
 
 OUTPUT: Return ONLY valid JSON (no markdown, no preamble):
 {
@@ -37,6 +36,17 @@ OUTPUT: Return ONLY valid JSON (no markdown, no preamble):
 """
 
 def generate_explainability_narrative(student_id: str, student_context: dict) -> dict:
+    course_type     = student_context.get("course_type", "Engineering")
+    institute_tier  = student_context.get("institute_tier", "B")
+    graduation_year = student_context.get("graduation_year", 2026)
+
+    shap_json   = execute_tool("get_shap_drivers", {"student_id": student_id})
+    cohort_json = execute_tool("get_peer_cohort_stats", {
+        "course_type":     course_type,
+        "institute_tier":  institute_tier,
+        "graduation_year": graduation_year,
+    })
+
     user_message = f"""
 Generate an explainability narrative for student {student_id}.
 
@@ -48,32 +58,47 @@ Current prediction outputs:
 - Confidence level: {student_context.get('confidence_level', 'MEDIUM')}
 
 Student data:
-- Course type: {student_context.get('course_type')}
-- Institute tier: {student_context.get('institute_tier')}
-- Graduation year: {student_context.get('graduation_year', 2026)}
+- Course type: {course_type}
+- Institute tier: {institute_tier}
+- Graduation year: {graduation_year}
 - CGPA: {student_context.get('cgpa')}
 - IQI: {student_context.get('iqi')}
 - Behavioral activity: {student_context.get('behavioral_activity_score')}
 - Field demand: {student_context.get('field_demand_score')}
 
-Steps:
-1. Call get_shap_drivers for student {student_id}
-2. Call get_peer_cohort_stats: course_type="{student_context.get('course_type', 'Engineering')}",
-   institute_tier="{student_context.get('institute_tier', 'B')}",
-   graduation_year={student_context.get('graduation_year', 2026)}
-3. Write the narrative JSON
+SHAP driver attributions (this student):
+{shap_json}
+
+Cohort benchmark stats:
+{cohort_json}
+
+Now write the narrative JSON. Return ONLY the JSON object, no preamble, no markdown fence.
 """
 
-    raw = run_agent(EXPLAIN_SYSTEM_PROMPT, user_message, TOOL_DEFINITIONS)
-
     try:
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        return json.loads(raw[start:end])
-    except (json.JSONDecodeError, ValueError):
+        raw = run_agent(EXPLAIN_SYSTEM_PROMPT, user_message, tools=[])
+    except Exception as e:
+        print(f"[Explain] LLM call failed: {type(e).__name__}: {e}")
         return {
-            "summary": raw[:300] if raw else "Explainability narrative unavailable.",
+            "summary": f"Explainability agent unavailable ({type(e).__name__}).",
             "positive_factors": [],
             "negative_factors": [],
-            "urgency_note": None
+            "urgency_note": None,
+            "_error": str(e),
         }
+
+    # Reuse the robust JSON extractor from nba_agent so we agree on parse rules
+    from nba_agent import _extract_json_object
+    parsed = _extract_json_object(raw)
+    if parsed is None:
+        return {
+            "summary": (raw or "Agent returned no text.")[:300],
+            "positive_factors": [],
+            "negative_factors": [],
+            "urgency_note": None,
+        }
+    parsed.setdefault("summary", "")
+    parsed.setdefault("positive_factors", [])
+    parsed.setdefault("negative_factors", [])
+    parsed.setdefault("urgency_note", None)
+    return parsed

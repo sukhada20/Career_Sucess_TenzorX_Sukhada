@@ -31,11 +31,11 @@ def score_student_full(student_data: dict) -> dict:
     try:
         from scoring_engine import ScoringEngine
         engine = ScoringEngine()
-        ml_scores = engine.predict(student_data)
+        ml_scores = _flatten_score(engine.score_student(student_data))
     except Exception as e:
         # Graceful fallback if scoring engine unavailable
         ml_scores = _fallback_ml_scores(student_data)
-        print(f"[Orchestrator] Scoring engine error: {e} — using fallback")
+        print(f"[Orchestrator] Scoring engine error: {e} -- using fallback")
 
     # ── Step 2: Enrich context with ML outputs ────────────────────────────────
     student_context = {
@@ -91,9 +91,63 @@ def score_student_fast(student_data: dict) -> dict:
     try:
         from scoring_engine import ScoringEngine
         engine = ScoringEngine()
-        return engine.predict(student_data)
+        return _flatten_score(engine.score_student(student_data))
     except Exception as e:
         return _fallback_ml_scores(student_data)
+
+
+def _flatten_score(nested: dict) -> dict:
+    """Map the nested shape returned by ScoringEngine.score_student into the flat
+    shape the rest of the agentic pipeline (and the frontend) expects. Keeps the
+    raw nested view under "_raw_ml" for anything that needs the original."""
+    pred    = nested.get("prediction", {}) or {}
+    explain = nested.get("explainability", {}) or {}
+    insights = nested.get("insights", {}) or {}
+    probs   = pred.get("placement_probability", {}) or {}
+    salary  = pred.get("salary_estimate", {}) or {}
+    confidence = explain.get("confidence", {}) or {}
+    peer    = insights.get("peer_benchmark", {}) or {}
+
+    p6 = probs.get("6m")
+    risk_score = int(round((1 - p6) * 100)) if isinstance(p6, (int, float)) else None
+
+    return {
+        "student_id": nested.get("student_id"),
+        "risk_band":  pred.get("risk_band"),
+        "risk_score": risk_score,
+        "placement_probability": {
+            "within_3_months":  probs.get("3m"),
+            "within_6_months":  probs.get("6m"),
+            "within_12_months": probs.get("12m"),
+        },
+        "salary_estimate": salary,
+        "emi_comfort": {
+            "ratio": insights.get("emi_comfort_index"),
+            "tier":  _emi_tier(insights.get("emi_comfort_index")),
+        },
+        "confidence": {
+            "level":      (confidence.get("rating") or "").upper() or None,
+            "percentage": confidence.get("score"),
+            "data_gaps":  confidence.get("data_gaps", []),
+        },
+        "peer_benchmark": {
+            "student_percentile":            peer.get("student_percentile"),
+            "cohort_median_probability_6m":  peer.get("cohort_median"),
+            "cohort":                        peer.get("cohort"),
+            "percentile_label":              peer.get("percentile_label"),
+        },
+        "risk_drivers": explain.get("top_drivers", []),
+        "_raw_ml": nested,
+    }
+
+
+def _emi_tier(ratio):
+    if not isinstance(ratio, (int, float)):
+        return None
+    if ratio >= 3.0: return "COMFORTABLE"
+    if ratio >= 2.0: return "ADEQUATE"
+    if ratio >= 1.0: return "TIGHT"
+    return "DISTRESS"
 
 
 def get_career_paths(student_id: str, student_context: dict) -> dict:

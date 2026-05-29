@@ -1,88 +1,279 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import axios from 'axios';
-import { BarChart3, TrendingUp, TrendingDown, Minus, RefreshCw, Filter } from 'lucide-react';
+import { MapContainer, TileLayer, CircleMarker, Popup, Tooltip as LeafletTooltip, useMap } from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import 'leaflet.heat';
+import { BarChart3, TrendingUp, TrendingDown, Minus, RefreshCw, Filter, MapPin, Briefcase, IndianRupee } from 'lucide-react';
 import { API_BASE } from '../App';
 
-const FIELD_COLORS = {
-  Engineering: 'var(--accent-primary)',
-  MBA: '#a855f7',
-  Nursing: '#ec4899',
+// ─── City coordinates ─────────────────────────────────────────
+const CITY_COORDS = {
+  'Mumbai':     { lat: 19.0760, lng: 72.8777, state: 'Maharashtra' },
+  'Bengaluru':  { lat: 12.9716, lng: 77.5946, state: 'Karnataka' },
+  'Delhi NCR':  { lat: 28.6139, lng: 77.2090, state: 'Delhi' },
+  'Pune':       { lat: 18.5204, lng: 73.8567, state: 'Maharashtra' },
+  'Hyderabad':  { lat: 17.3850, lng: 78.4867, state: 'Telangana' },
+  'Chennai':    { lat: 13.0827, lng: 80.2707, state: 'Tamil Nadu' },
 };
 
-const DEMAND_COLOR = (score) => {
-  if (score >= 80) return { bg: 'rgba(16,185,129,0.15)', border: 'rgba(16,185,129,0.4)', text: '#10B981' };
-  if (score >= 65) return { bg: 'rgba(245,158,11,0.12)', border: 'rgba(245,158,11,0.35)', text: '#F59E0B' };
-  return { bg: 'rgba(239,68,68,0.10)', border: 'rgba(239,68,68,0.30)', text: '#EF4444' };
+const FIELD_INK = {
+  Engineering: '#1B2C5E',
+  MBA:         '#C2410C',
+  Nursing:     '#2F6E45',
+};
+
+// Demand → editorial palette
+const demandPalette = (score) => {
+  if (score >= 75) return { hex: '#2F6E45', label: 'HIGH',   bg: 'rgba(47,110,69,0.08)' };
+  if (score >= 55) return { hex: '#A5751F', label: 'MEDIUM', bg: 'rgba(165,117,31,0.09)' };
+  return                  { hex: '#A82828', label: 'LOW',    bg: 'rgba(168,40,40,0.08)' };
 };
 
 function TrendBadge({ trend }) {
   const isUp = trend?.startsWith('+');
   const isDown = trend?.startsWith('-');
+  const color = isUp ? '#2F6E45' : isDown ? '#A82828' : '#5E564B';
+  const bg = isUp ? 'rgba(47,110,69,0.10)' : isDown ? 'rgba(168,40,40,0.10)' : 'var(--paper-deep)';
   return (
     <span style={{
-      fontSize: '0.7rem', fontWeight: 700, padding: '1px 6px', borderRadius: '4px',
-      background: isUp ? 'rgba(16,185,129,0.15)' : isDown ? 'rgba(239,68,68,0.12)' : 'rgba(100,116,139,0.15)',
-      color: isUp ? '#10B981' : isDown ? '#EF4444' : '#94a3b8',
-      display: 'inline-flex', alignItems: 'center', gap: '2px'
+      display: 'inline-flex', alignItems: 'center', gap: '3px',
+      fontFamily: 'var(--font-mono)',
+      fontSize: '0.7rem', fontWeight: 500,
+      padding: '2px 7px', borderRadius: '2px',
+      background: bg, color, border: `1px solid ${color}40`,
+      letterSpacing: '-0.01em',
     }}>
-      {isUp ? <TrendingUp size={9} /> : isDown ? <TrendingDown size={9} /> : <Minus size={9} />}
+      {isUp ? <TrendingUp size={10} /> : isDown ? <TrendingDown size={10} /> : <Minus size={10} />}
       {trend}
     </span>
   );
 }
 
-function HeatCell({ cell, onClick, selected }) {
-  const colors = DEMAND_COLOR(cell.demand_score);
-  return (
-    <div
-      onClick={() => onClick(cell)}
-      style={{
-        background: selected ? colors.bg : 'rgba(255,255,255,0.03)',
-        border: `1px solid ${selected ? colors.border : 'var(--border-color)'}`,
-        borderRadius: '10px',
-        padding: '0.85rem',
-        cursor: 'pointer',
-        transition: 'all 0.2s',
-        position: 'relative',
-        overflow: 'hidden',
-      }}
-      onMouseEnter={e => { e.currentTarget.style.background = colors.bg; e.currentTarget.style.borderColor = colors.border; }}
-      onMouseLeave={e => {
-        if (!selected) {
-          e.currentTarget.style.background = 'rgba(255,255,255,0.03)';
-          e.currentTarget.style.borderColor = 'var(--border-color)';
-        }
-      }}
-    >
-      {/* Score bar in background */}
-      <div style={{ position: 'absolute', bottom: 0, left: 0, height: '3px', width: `${cell.demand_score}%`, background: colors.text, opacity: 0.6, borderRadius: '0 0 0 10px' }} />
+// ─── Map controller — fits India bounds on mount ──────────────
+function FitIndia() {
+  const map = useMap();
+  useEffect(() => {
+    // India bounds (south-west to north-east)
+    map.fitBounds([[6.4, 68.0], [35.5, 97.5]], { padding: [20, 20] });
+  }, [map]);
+  return null;
+}
 
-      <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: '0.2rem' }}>{cell.region}</div>
-      <div style={{ fontSize: '1.6rem', fontWeight: 800, color: colors.text, lineHeight: 1 }}>{cell.demand_score}</div>
-      <div style={{ marginTop: '0.3rem' }}>
-        <TrendBadge trend={cell.trend} />
+// ─── Real density heatmap layer ───────────────────────────────
+// Renders an actual gradient density blob (leaflet.heat) instead of plain
+// CircleMarkers. The `intensity` scales with each hub's avg demand score,
+// so high-demand hubs paint a hotter / wider plume. Editorial palette:
+//   low  → low-stop green     (#2F6E45)
+//   mid  → ochre              (#A5751F)
+//   high → deep oxide red     (#A82828)
+function HeatLayer({ points, gradient, radius = 75, blur = 60 }) {
+  const map = useMap();
+  const layerRef = useRef(null);
+
+  useEffect(() => {
+    if (!points || points.length === 0) return;
+    if (layerRef.current) {
+      map.removeLayer(layerRef.current);
+      layerRef.current = null;
+    }
+    layerRef.current = L.heatLayer(points, {
+      radius,
+      blur,
+      maxZoom: 9,
+      minOpacity: 0.35,
+      gradient,
+    }).addTo(map);
+    return () => {
+      if (layerRef.current) {
+        map.removeLayer(layerRef.current);
+        layerRef.current = null;
+      }
+    };
+  }, [map, points, gradient, radius, blur]);
+  return null;
+}
+
+// ─── Rich popup content for a city ────────────────────────────
+function CityPopupContent({ city, fields }) {
+  const meta = CITY_COORDS[city];
+  const avgDemand = Math.round(fields.reduce((s, f) => s + f.demand_score, 0) / (fields.length || 1));
+  const palette = demandPalette(avgDemand);
+  const avgSalary = Math.round(fields.reduce((s, f) => s + (f.avg_fresher_salary_inr || 0), 0) / (fields.length || 1));
+
+  return (
+    <div style={{ minWidth: '300px', maxWidth: '340px', fontFamily: 'var(--font-sans)' }}>
+      {/* Eyebrow */}
+      <div style={{
+        fontFamily: 'var(--font-sans)',
+        fontSize: '0.6rem', fontWeight: 700,
+        letterSpacing: '0.22em', textTransform: 'uppercase',
+        color: 'var(--signal)', marginBottom: '0.45rem',
+      }}>
+        Hiring Hub · {meta?.state}
+      </div>
+
+      {/* City + headline number */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '0.85rem' }}>
+        <h3 style={{
+          fontFamily: 'var(--font-display)',
+          fontWeight: 400, fontSize: '1.55rem',
+          fontVariationSettings: '"opsz" 72',
+          letterSpacing: '-0.025em',
+          color: 'var(--ink)',
+          margin: 0, lineHeight: 1.05,
+        }}>{city}</h3>
+        <span style={{
+          fontFamily: 'var(--font-display)',
+          fontSize: '1.95rem', fontWeight: 400,
+          fontVariationSettings: '"opsz" 144',
+          letterSpacing: '-0.04em',
+          color: palette.hex,
+          fontFeatureSettings: '"tnum"',
+          lineHeight: 1,
+        }}>
+          {avgDemand}
+          <span style={{ fontSize: '0.7rem', color: 'var(--ink-faint)', marginLeft: '2px', fontFamily: 'var(--font-sans)' }}>/100</span>
+        </span>
+      </div>
+
+      {/* Aggregate row */}
+      <div style={{
+        display: 'flex', gap: '0.75rem', flexWrap: 'wrap',
+        paddingBottom: '0.75rem',
+        borderBottom: '1px solid var(--rule-strong)',
+        marginBottom: '0.75rem',
+      }}>
+        <span className={`badge badge-${palette.label === 'HIGH' ? 'low' : palette.label === 'MEDIUM' ? 'medium' : 'high'}`}>
+          {palette.label === 'HIGH' ? 'High demand' : palette.label === 'MEDIUM' ? 'Medium demand' : 'Low demand'}
+        </span>
+        <span style={{
+          display: 'inline-flex', alignItems: 'center', gap: '4px',
+          fontFamily: 'var(--font-mono)', fontSize: '0.78rem',
+          color: 'var(--ink-soft)',
+        }}>
+          <IndianRupee size={11} />
+          {avgSalary?.toLocaleString('en-IN')}
+          <span style={{ color: 'var(--ink-faint)', fontFamily: 'var(--font-sans)', fontSize: '0.68rem', marginLeft: '2px' }}>avg fresher</span>
+        </span>
+      </div>
+
+      {/* Per-field breakdown */}
+      <div style={{
+        fontSize: '0.6rem', fontWeight: 700,
+        letterSpacing: '0.22em', textTransform: 'uppercase',
+        color: 'var(--ink-faint)', marginBottom: '0.55rem',
+      }}>
+        Field-level demand
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+        {fields.map(f => {
+          const fp = demandPalette(f.demand_score);
+          return (
+            <div key={f.field} style={{
+              display: 'grid',
+              gridTemplateColumns: '16px 1fr auto auto',
+              gap: '0.6rem',
+              alignItems: 'center',
+            }}>
+              <span style={{
+                width: '4px', height: '18px',
+                background: FIELD_INK[f.field] || 'var(--ink)',
+                display: 'inline-block',
+              }} />
+              <div style={{ minWidth: 0 }}>
+                <div style={{
+                  fontSize: '0.85rem', fontWeight: 600,
+                  color: 'var(--ink)', letterSpacing: '-0.005em',
+                }}>{f.field}</div>
+                {f.top_roles?.length > 0 && (
+                  <div style={{
+                    fontSize: '0.68rem',
+                    color: 'var(--ink-muted)',
+                    marginTop: '1px',
+                    textOverflow: 'ellipsis',
+                    overflow: 'hidden',
+                    whiteSpace: 'nowrap',
+                  }} title={f.top_roles.join(', ')}>
+                    {f.top_roles.slice(0, 2).join(' · ')}
+                  </div>
+                )}
+              </div>
+              <span style={{
+                fontFamily: 'var(--font-display)',
+                fontSize: '1.05rem', fontWeight: 400,
+                fontVariationSettings: '"opsz" 48',
+                color: fp.hex,
+                fontFeatureSettings: '"tnum"',
+                letterSpacing: '-0.02em',
+              }}>{f.demand_score}</span>
+              <TrendBadge trend={f.trend} />
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Salary detail per field */}
+      <div style={{
+        marginTop: '0.85rem',
+        paddingTop: '0.75rem',
+        borderTop: '1px solid var(--rule)',
+        display: 'flex', flexDirection: 'column', gap: '0.3rem',
+      }}>
+        <div style={{
+          fontSize: '0.6rem', fontWeight: 700,
+          letterSpacing: '0.22em', textTransform: 'uppercase',
+          color: 'var(--ink-faint)', marginBottom: '0.3rem',
+        }}>
+          Avg fresher salary (₹/yr)
+        </div>
+        {fields.map(f => (
+          <div key={f.field} style={{
+            display: 'flex', justifyContent: 'space-between',
+            fontSize: '0.78rem',
+            color: 'var(--ink-soft)',
+          }}>
+            <span style={{ color: 'var(--ink-muted)' }}>{f.field}</span>
+            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--ink)', fontFeatureSettings: '"tnum"' }}>
+              ₹{f.avg_fresher_salary_inr?.toLocaleString('en-IN') || '—'}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {/* Source line */}
+      <div style={{
+        marginTop: '0.85rem',
+        paddingTop: '0.55rem',
+        borderTop: '1px solid var(--rule)',
+        fontSize: '0.6rem',
+        color: 'var(--ink-faint)',
+        letterSpacing: '0.04em',
+        fontStyle: 'italic',
+      }}>
+        Source — World Bank macro + Foundit/Naukri job-posting volumes (2025).
       </div>
     </div>
   );
 }
 
+// ─── Main Heatmap ───────────────────────────────────────────
 function Heatmap() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [filterField, setFilterField] = useState('ALL');
-  const [filterRegion, setFilterRegion] = useState('ALL');
-  const [selected, setSelected] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const popupRefs = useRef({});
 
   const fetchData = async () => {
     setRefreshing(true);
     try {
       const params = {};
       if (filterField !== 'ALL') params.field = filterField;
-      if (filterRegion !== 'ALL') params.region = filterRegion;
       const res = await axios.get(`${API_BASE}/api/v1/heatmap/demand`, { params });
       setData(res.data);
-    } catch (e) {
+    } catch {
       setData(null);
     } finally {
       setLoading(false);
@@ -90,116 +281,276 @@ function Heatmap() {
     }
   };
 
-  useEffect(() => { fetchData(); }, [filterField, filterRegion]);
+  useEffect(() => { fetchData(); }, [filterField]);
 
-  const fields = ['ALL', 'Engineering', 'MBA', 'Nursing'];
-  const regions = ['ALL', 'Mumbai', 'Bengaluru', 'Delhi NCR', 'Pune', 'Hyderabad', 'Chennai'];
+  // Group grid cells by region
+  const byCity = useMemo(() => {
+    const map = {};
+    (data?.grid || []).forEach(cell => {
+      if (!map[cell.region]) map[cell.region] = [];
+      map[cell.region].push(cell);
+    });
+    return map;
+  }, [data]);
+
+  // Density-layer points: [lat, lng, intensity 0–1]. Avg demand per hub →
+  // intensity. To get a wider density "footprint" without inventing fake
+  // coordinates, drop one extra weighted point per per-field cell so highly
+  // diversified hubs (Engineering + MBA + Nursing all hot) glow more.
+  const heatPoints = useMemo(() => {
+    const pts = [];
+    Object.entries(byCity).forEach(([city, cells]) => {
+      const meta = CITY_COORDS[city];
+      if (!meta) return;
+      const avg = cells.reduce((s, c) => s + c.demand_score, 0) / cells.length;
+      pts.push([meta.lat, meta.lng, Math.max(0.15, avg / 100)]);
+      cells.forEach((c, i) => {
+        // Spread companions in a small ring for a bigger plume
+        const angle = (i / cells.length) * Math.PI * 2;
+        const r = 0.45;  // ~50 km offset
+        pts.push([
+          meta.lat + Math.sin(angle) * r,
+          meta.lng + Math.cos(angle) * r,
+          Math.max(0.10, c.demand_score / 100 * 0.75),
+        ]);
+      });
+    });
+    return pts;
+  }, [byCity]);
+
+  const heatGradient = {
+    0.20: '#2F6E45',
+    0.50: '#A5751F',
+    0.80: '#C2410C',
+    1.00: '#A82828',
+  };
 
   if (loading) return (
-    <div style={{ padding: '3rem', display: 'flex', gap: '1rem', alignItems: 'center', color: 'var(--text-secondary)' }}>
+    <div style={{ padding: '3rem', display: 'flex', gap: '1rem', alignItems: 'center', color: 'var(--ink-muted)' }}>
       <RefreshCw size={18} style={{ animation: 'spin 1s linear infinite' }} />
-      Loading heatmap...
+      Loading employability map…
     </div>
   );
 
-  const grid = data?.grid || [];
-  const fieldGroups = [...new Set(grid.map(c => c.field))];
+  const fields = ['ALL', 'Engineering', 'MBA', 'Nursing'];
 
   return (
     <div className="animate-fade-up">
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-        <div>
-          <h1>Dynamic Employability Heatmap ⭐</h1>
-          <p>Real-time field × region demand scores. Green = high hiring activity. Updated: {data?.last_updated}</p>
+      {/* Header */}
+      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: '2rem', flexWrap: 'wrap' }}>
+        <div style={{ flex: 1, minWidth: '320px' }}>
+          <div className="eyebrow" style={{ marginBottom: '0.85rem', color: 'var(--signal)' }}>
+            <span style={{ marginRight: '0.5em' }}>§ 03</span>
+            Geographic Demand
+          </div>
+          <h1>Dynamic Employability Map — India</h1>
+          <p style={{ marginTop: '0.55rem' }}>
+            Hover any hub for the full hiring spec: field-level demand, top roles, avg fresher salary, momentum trend.{' '}
+            <span className="mono" style={{ color: 'var(--ink)' }}>
+              {data?.grid?.length || 0} cells
+            </span>
+            {' '}across <span className="mono" style={{ color: 'var(--ink)' }}>{Object.keys(byCity).length}</span> hubs · last updated {data?.last_updated}.
+          </p>
         </div>
         <button className="btn btn-ghost" onClick={fetchData} disabled={refreshing}>
-          <RefreshCw size={14} style={refreshing ? { animation: 'spin 1s linear infinite' } : {}} />
+          <RefreshCw size={13} style={refreshing ? { animation: 'spin 1s linear infinite' } : {}} />
           Refresh
         </button>
       </div>
 
       {/* Filters */}
-      <div className="card" style={{ marginBottom: '1.5rem', padding: '1rem 1.25rem' }}>
-        <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-            <Filter size={13} style={{ color: 'var(--text-secondary)' }} />
-            <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', fontWeight: 600 }}>Field:</span>
+      <div className="card" style={{ marginBottom: '1.25rem', padding: '0.9rem 1.25rem' }}>
+        <div style={{ display: 'flex', gap: '1.25rem', flexWrap: 'wrap', alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '0.45rem', alignItems: 'center' }}>
+            <Filter size={13} style={{ color: 'var(--ink-muted)' }} />
+            <span style={{
+              fontSize: '0.65rem', fontWeight: 700, letterSpacing: '0.18em',
+              textTransform: 'uppercase', color: 'var(--ink-muted)',
+            }}>Field</span>
             {fields.map(f => (
               <button key={f} onClick={() => setFilterField(f)}
-                className={`badge ${filterField === f ? 'badge-info' : ''}`}
-                style={{ cursor: 'pointer', opacity: filterField === f ? 1 : 0.5, border: filterField === f ? '1px solid var(--accent-primary)' : '1px solid transparent' }}>
+                style={{
+                  padding: '0.32rem 0.75rem',
+                  fontSize: '0.7rem', fontWeight: 700,
+                  letterSpacing: '0.10em', textTransform: 'uppercase',
+                  cursor: 'pointer',
+                  border: filterField === f ? '1px solid var(--ink)' : '1px solid var(--card-edge)',
+                  background: filterField === f ? 'var(--ink)' : 'transparent',
+                  color: filterField === f ? 'var(--card-raised)' : 'var(--ink-muted)',
+                  borderRadius: '2px',
+                  fontFamily: 'var(--font-sans)',
+                  transition: 'all 0.2s',
+                }}>
                 {f}
               </button>
             ))}
           </div>
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-            <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', fontWeight: 600 }}>Region:</span>
-            <select className="select-input" value={filterRegion} onChange={e => setFilterRegion(e.target.value)} style={{ fontSize: '0.82rem' }}>
-              {regions.map(r => <option key={r} value={r}>{r}</option>)}
-            </select>
-          </div>
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: '1rem', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-            <span>🟢 ≥80 High Demand</span>
-            <span>🟡 65–79 Medium</span>
-            <span>🔴 &lt;65 Low Demand</span>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: '1.1rem', alignItems: 'center', fontSize: '0.7rem', fontWeight: 600, color: 'var(--ink-muted)', letterSpacing: '0.04em' }}>
+            <LegendDot color="#2F6E45" label="≥ 75 High demand" />
+            <LegendDot color="#A5751F" label="55–74 Medium" />
+            <LegendDot color="#A82828" label="< 55 Low" />
           </div>
         </div>
       </div>
 
-      {/* Heatmap Grid per field */}
-      {fieldGroups.map(field => {
-        const cells = grid.filter(c => c.field === field);
-        const avgDemand = Math.round(cells.reduce((s, c) => s + c.demand_score, 0) / (cells.length || 1));
-        return (
-          <div key={field} className="card" style={{ marginBottom: '1.25rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
-              <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: FIELD_COLORS[field] || 'var(--accent-primary)' }} />
-              <div className="card-title" style={{ margin: 0 }}><BarChart3 size={14} /> {field}</div>
-              <span className="badge badge-info" style={{ marginLeft: 'auto', fontSize: '0.75rem' }}>Avg demand: {avgDemand}/100</span>
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(cells.length, 6)}, 1fr)`, gap: '0.75rem' }}>
-              {cells.map((cell, i) => (
-                <HeatCell key={i} cell={cell} selected={selected?.field === cell.field && selected?.region === cell.region} onClick={setSelected} />
-              ))}
-            </div>
-          </div>
-        );
-      })}
+      {/* Map card */}
+      <div className="card" style={{ padding: 0, overflow: 'hidden', marginBottom: '1.5rem', position: 'relative' }}>
+        {/* Card eyebrow positioned on map */}
+        <div style={{
+          position: 'absolute',
+          top: '14px', left: '14px',
+          zIndex: 500,
+          background: 'var(--card-raised)',
+          border: '1px solid var(--card-edge-strong)',
+          borderLeft: '3px solid var(--signal)',
+          padding: '0.5rem 0.85rem',
+          borderRadius: '2px',
+          fontFamily: 'var(--font-sans)',
+          fontSize: '0.62rem',
+          fontWeight: 700,
+          letterSpacing: '0.20em',
+          textTransform: 'uppercase',
+          color: 'var(--ink)',
+          boxShadow: 'var(--shadow-card)',
+        }}>
+          <MapPin size={11} style={{ display: 'inline-block', marginRight: '6px', color: 'var(--signal)', verticalAlign: '-1px' }} />
+          {Object.keys(byCity).length} hiring hubs
+        </div>
 
-      {/* Detail panel */}
-      {selected && (
-        <div className="card" style={{ borderTop: `2px solid ${DEMAND_COLOR(selected.demand_score).text}` }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem' }}>
-            <div>
-              <div className="card-title"><TrendingUp size={14} /> {selected.field} · {selected.region}</div>
-              <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.4rem', alignItems: 'center' }}>
-                <span style={{ fontSize: '2rem', fontWeight: 800, color: DEMAND_COLOR(selected.demand_score).text }}>{selected.demand_score}/100</span>
-                <TrendBadge trend={selected.trend} />
-                <span className={`badge badge-${selected.risk_level === 'HIGH' ? 'low' : selected.risk_level === 'MEDIUM' ? 'medium' : 'high'}`}>
-                  {selected.risk_level === 'HIGH' ? 'High Demand' : selected.risk_level === 'MEDIUM' ? 'Medium Demand' : 'Low Demand'}
-                </span>
-              </div>
-            </div>
-            <button className="btn btn-ghost" onClick={() => setSelected(null)}>✕ Close</button>
-          </div>
-          <div>
-            <div style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', marginBottom: '0.5rem', fontWeight: 600 }}>Top Hiring Roles:</div>
-            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-              {selected.top_roles?.map((role, i) => (
-                <span key={i} style={{
-                  padding: '0.3rem 0.75rem', borderRadius: '20px', fontSize: '0.82rem', fontWeight: 500,
-                  background: DEMAND_COLOR(selected.demand_score).bg,
-                  border: `1px solid ${DEMAND_COLOR(selected.demand_score).border}`,
-                  color: DEMAND_COLOR(selected.demand_score).text
-                }}>
-                  {role}
-                </span>
-              ))}
+        <div style={{ height: '560px', width: '100%', position: 'relative', background: '#F2EFE8' }}>
+          <MapContainer
+            center={[22.0, 79.0]}
+            zoom={5}
+            minZoom={4}
+            maxZoom={9}
+            style={{ height: '100%', width: '100%', background: '#F2EFE8' }}
+            zoomControl
+            scrollWheelZoom
+            attributionControl
+          >
+            <FitIndia />
+            {/* Free CartoDB Positron — minimal grayscale, paper-friendly, no API key */}
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+              url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+              subdomains="abcd"
+              maxZoom={19}
+            />
+
+            {/* Real density gradient layer — leaflet.heat */}
+            <HeatLayer points={heatPoints} gradient={heatGradient} radius={85} blur={70} />
+
+            {/* Compact click-target markers (small, on top of the heat plume) */}
+            {Object.entries(byCity).map(([city, cells]) => {
+              const meta = CITY_COORDS[city];
+              if (!meta) return null;
+              const avgDemand = Math.round(cells.reduce((s, c) => s + c.demand_score, 0) / cells.length);
+              const palette = demandPalette(avgDemand);
+              return (
+                <CircleMarker
+                  key={city}
+                  center={[meta.lat, meta.lng]}
+                  radius={6}
+                  pathOptions={{
+                    color: 'var(--ink)',
+                    fillColor: palette.hex,
+                    fillOpacity: 1,
+                    weight: 2,
+                    opacity: 1,
+                  }}
+                  eventHandlers={{
+                    mouseover: (e) => e.target.openPopup(),
+                  }}
+                >
+                  <LeafletTooltip
+                    direction="top"
+                    offset={[0, -10]}
+                    opacity={1}
+                    permanent={false}
+                    className="paper-tooltip-label"
+                  >
+                    <strong>{city}</strong> — {avgDemand}/100
+                  </LeafletTooltip>
+                  <Popup
+                    maxWidth={360}
+                    minWidth={300}
+                    closeButton={false}
+                    className="paper-popup"
+                    autoPan={false}
+                    ref={(el) => { popupRefs.current[city] = el; }}
+                  >
+                    <CityPopupContent city={city} fields={cells} />
+                  </Popup>
+                </CircleMarker>
+              );
+            })}
+          </MapContainer>
+
+          {/* Gradient legend bar (real heatmap has a real legend) */}
+          <div className="heat-legend">
+            <div className="heat-legend-label">Hiring Demand</div>
+            <div className="heat-legend-bar" />
+            <div className="heat-legend-ticks">
+              <span>0</span><span>50</span><span>100</span>
             </div>
           </div>
         </div>
-      )}
+      </div>
+
+      {/* Per-city summary band — for accessibility / scanability */}
+      <div className="grid-3" style={{ marginBottom: '1.25rem' }}>
+        {Object.entries(byCity).map(([city, cells]) => {
+          const avg = Math.round(cells.reduce((s, c) => s + c.demand_score, 0) / cells.length);
+          const palette = demandPalette(avg);
+          return (
+            <div key={city} className="card" style={{ borderLeft: `3px solid ${palette.hex}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '0.5rem' }}>
+                <div className="card-title" style={{ margin: 0 }}>
+                  <MapPin size={12} /> {city}
+                </div>
+                <span style={{
+                  fontFamily: 'var(--font-display)',
+                  fontSize: '1.55rem', fontWeight: 400,
+                  fontVariationSettings: '"opsz" 96',
+                  letterSpacing: '-0.03em',
+                  color: palette.hex,
+                  fontFeatureSettings: '"tnum"',
+                }}>
+                  {avg}
+                  <span style={{ fontSize: '0.62rem', color: 'var(--ink-faint)', fontFamily: 'var(--font-sans)', marginLeft: '2px' }}>/100</span>
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                {cells.map(c => (
+                  <div key={c.field} style={{
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    fontSize: '0.78rem',
+                  }}>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', color: 'var(--ink-soft)' }}>
+                      <span style={{ width: '2px', height: '12px', background: FIELD_INK[c.field] }} />
+                      {c.field}
+                    </span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '0.55rem' }}>
+                      <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--ink)', fontFeatureSettings: '"tnum"' }}>{c.demand_score}</span>
+                      <TrendBadge trend={c.trend} />
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
+  );
+}
+
+function LegendDot({ color, label }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+      <span style={{ width: '9px', height: '9px', borderRadius: '50%', background: color, border: '1px solid var(--ink)', opacity: 0.85 }} />
+      {label}
+    </span>
   );
 }
 

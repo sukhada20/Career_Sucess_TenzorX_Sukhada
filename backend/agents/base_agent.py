@@ -54,7 +54,7 @@ def run_agent(
             tool_results = []
             for tc in response.tool_calls:
                 result_str = execute_tool(tc["name"], tc["input"])
-                print(f"  [Tool] {tc['name']}({list(tc['input'].keys())}) → {result_str[:120]}...")
+                print(f"  [Tool] {tc['name']}({list(tc['input'].keys())}) -> {result_str[:120]}...")
                 tool_results.append({
                     "tool_call_id": tc["id"],
                     "result": result_str,

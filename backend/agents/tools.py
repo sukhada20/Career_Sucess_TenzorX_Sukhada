@@ -244,7 +244,7 @@ def _dispatch(name: str, inp: dict) -> dict:
     if name == "predict_placement_probability":
         engine = _get_engine()
         features = inp["student_features"]
-        result = engine.predict(features)
+        result = engine.score_student(features)
         return {
             "placement_probability": result.get("placement_probability", {
                 "within_3_months": 0.45,

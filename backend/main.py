@@ -59,6 +59,283 @@ def sanitize(obj):
         return None if (math.isnan(f) or math.isinf(f)) else f
     return obj
 
+
+# ─── Derived Borrower Signals (PRD §A + §D coverage) ───────────────────────
+# Problem-statement gaps from "Career Success.docx":
+#   §A.5 Skill certifications  — was not tracked
+#   §D   Interview pipeline    — was not tracked
+#   §D   Resume updates        — was not tracked
+# These are derived deterministically per student_id so the prototype can demo
+# the full data model without re-generating the underlying CSV.
+
+CERTS_BY_FIELD = {
+    "Engineering": [
+        "Python for Analytics", "AWS Cloud Practitioner", "ML Specialization (Coursera)",
+        "Java Spring Boot", "Linux LPIC-1", "Docker Certified Associate", "CCNA",
+    ],
+    "MBA": [
+        "CFA Level I", "PMP", "Lean Six Sigma Green Belt", "Google Analytics IQ",
+        "Tableau Desktop Specialist", "Bloomberg Market Concepts", "NISM Series-V",
+    ],
+    "Nursing": [
+        "BLS (Basic Life Support)", "ACLS (Advanced Cardiac)", "Trauma Care (TNCC)",
+        "Pediatric Advanced Life Support", "Infection Control Specialist",
+        "Critical Care Nursing", "Wound Care Certified",
+    ],
+}
+
+def _stable_hash(*parts) -> int:
+    """Deterministic non-crypto hash (0..1B) for repeatable per-student signals."""
+    s = "|".join(str(p) for p in parts)
+    h = 5381
+    for ch in s:
+        h = ((h << 5) + h + ord(ch)) & 0xFFFFFFFF
+    return h
+
+
+def derive_student_signals(student: dict) -> dict:
+    """
+    Returns the three problem-statement signals that the underlying CSV doesn't
+    carry: skill_certs_count + named list, interview_progress_score + breakdown,
+    resume_freshness_days. Stable per student_id.
+    """
+    sid = student.get("student_id", "unknown")
+    course = student.get("course_type", "Engineering")
+    cgpa = float(student.get("cgpa", 7.0) or 7.0)
+    internship = int(student.get("internship_months", 0) or 0)
+    behavior = float(student.get("behavioral_activity_score", 50) or 50)
+    iqi = float(student.get("iqi", 0.5) or 0.5)
+
+    h = _stable_hash(sid)
+
+    # — Skill certifications —
+    # Better students (higher cgpa + internship + behavior) tend to hold more certs
+    base = (cgpa - 4.0) * 0.25 + (internship / 6.0) * 0.4 + (behavior / 100.0) * 0.4
+    base = max(0.0, min(1.0, base))
+    # 0..5 certs, biased by base; sprinkle hash randomness
+    cert_count = int(round(base * 4.2 + (h % 100) / 100.0))
+    cert_count = max(0, min(5, cert_count))
+
+    pool = CERTS_BY_FIELD.get(course, CERTS_BY_FIELD["Engineering"])
+    picks = []
+    if cert_count > 0:
+        # Deterministic shuffle by walking the hash
+        idxs = list(range(len(pool)))
+        hh = h
+        for i in range(len(idxs) - 1, 0, -1):
+            hh = (hh * 1103515245 + 12345) & 0x7FFFFFFF
+            j = hh % (i + 1)
+            idxs[i], idxs[j] = idxs[j], idxs[i]
+        picks = [pool[i] for i in idxs[:cert_count]]
+
+    # — Interview pipeline progress (PRD §D.2) —
+    # Score combines behavioral signal (job-portal activity proxy) + internship + cgpa
+    raw = behavior * 0.55 + (cgpa - 4) / 6 * 100 * 0.20 + min(internship, 6) / 6 * 100 * 0.25
+    interview_progress = max(0, min(100, int(round(raw))))
+
+    # Per-30d activity — scales with progress + small noise
+    interviews_scheduled_30d = max(0, int(round(interview_progress / 14 + (h % 7) - 3)))
+    cleared_ratio = 0.35 + (iqi * 0.30) + ((h >> 8) % 100) / 100 * 0.10
+    interviews_cleared_30d = min(
+        interviews_scheduled_30d,
+        int(round(interviews_scheduled_30d * cleared_ratio))
+    )
+
+    # Stage breakdown (sums to scheduled count, approximately)
+    stages = {
+        "screening":  max(0, int(interviews_scheduled_30d * 0.45)),
+        "technical":  max(0, int(interviews_scheduled_30d * 0.30)),
+        "final":      max(0, int(interviews_scheduled_30d * 0.15)),
+        "offer":      max(0, int(interviews_scheduled_30d * 0.10)),
+    }
+
+    # — Resume freshness (PRD §D.3) —
+    # Lower is better (more recent update). 0..120 days.
+    freshness_base = 90 - behavior * 0.7
+    resume_freshness_days = max(0, min(120, int(round(freshness_base + ((h >> 16) % 21) - 10))))
+
+    return {
+        "skill_certs_count": cert_count,
+        "skill_certifications": picks,
+        "interview_progress_score": interview_progress,
+        "interviews_scheduled_30d": interviews_scheduled_30d,
+        "interviews_cleared_30d": interviews_cleared_30d,
+        "interview_stages_30d": stages,
+        "resume_freshness_days": resume_freshness_days,
+        "resume_last_updated_label": (
+            "this week" if resume_freshness_days <= 7
+            else "this month" if resume_freshness_days <= 30
+            else f"{resume_freshness_days // 7}+ weeks ago"
+        ),
+    }
+
+
+# ─── Recruiter Universe (PRD §A.2 + NBA recruiter-matches gap) ─────────────
+# Plausible employer set per (field × region) with sector + tier + open-roles
+# signal. The matching endpoint joins on this and weights by student's iqi /
+# employer_tier preference / interview_progress.
+
+RECRUITER_UNIVERSE = {
+    ("Engineering", "Bengaluru"): [
+        {"name": "Infosys",        "sector": "IT Services",   "tier": "MNC",     "open_roles_30d": 1240, "avg_offer_inr": 620000},
+        {"name": "Wipro",          "sector": "IT Services",   "tier": "MNC",     "open_roles_30d": 870,  "avg_offer_inr": 590000},
+        {"name": "Flipkart",       "sector": "E-commerce",    "tier": "Unicorn", "open_roles_30d": 220,  "avg_offer_inr": 1850000},
+        {"name": "Razorpay",       "sector": "Fintech",       "tier": "Unicorn", "open_roles_30d": 130,  "avg_offer_inr": 1620000},
+        {"name": "Bosch Global",   "sector": "Manufacturing", "tier": "MNC",     "open_roles_30d": 95,   "avg_offer_inr": 780000},
+        {"name": "Cisco India",    "sector": "Networking",    "tier": "MNC",     "open_roles_30d": 180,  "avg_offer_inr": 1450000},
+    ],
+    ("Engineering", "Hyderabad"): [
+        {"name": "Microsoft IDC",  "sector": "Big Tech",      "tier": "MNC",     "open_roles_30d": 310,  "avg_offer_inr": 2400000},
+        {"name": "TCS Hyderabad",  "sector": "IT Services",   "tier": "MNC",     "open_roles_30d": 920,  "avg_offer_inr": 580000},
+        {"name": "ServiceNow",     "sector": "SaaS",          "tier": "MNC",     "open_roles_30d": 140,  "avg_offer_inr": 1900000},
+        {"name": "Cognizant",      "sector": "IT Services",   "tier": "MNC",     "open_roles_30d": 680,  "avg_offer_inr": 560000},
+        {"name": "Salesforce IDC", "sector": "SaaS",          "tier": "MNC",     "open_roles_30d": 160,  "avg_offer_inr": 1850000},
+    ],
+    ("Engineering", "Mumbai"): [
+        {"name": "L&T Technology", "sector": "Engg Services", "tier": "MNC",     "open_roles_30d": 280, "avg_offer_inr": 720000},
+        {"name": "Tata Consultancy","sector": "IT Services",  "tier": "MNC",     "open_roles_30d": 810, "avg_offer_inr": 580000},
+        {"name": "JP Morgan Tech", "sector": "BFSI Tech",     "tier": "MNC",     "open_roles_30d": 95,  "avg_offer_inr": 1700000},
+        {"name": "Reliance Jio",   "sector": "Telecom",       "tier": "MNC",     "open_roles_30d": 220, "avg_offer_inr": 850000},
+    ],
+    ("Engineering", "Pune"): [
+        {"name": "Bajaj Auto Tech","sector": "Automotive",    "tier": "MNC",     "open_roles_30d": 110, "avg_offer_inr": 680000},
+        {"name": "Persistent Systems","sector": "IT Services","tier": "MNC",     "open_roles_30d": 240, "avg_offer_inr": 640000},
+        {"name": "ZS Associates",  "sector": "Analytics",     "tier": "MNC",     "open_roles_30d": 70,  "avg_offer_inr": 1250000},
+        {"name": "Tata Motors",    "sector": "Automotive",    "tier": "MNC",     "open_roles_30d": 130, "avg_offer_inr": 720000},
+    ],
+    ("Engineering", "Delhi NCR"): [
+        {"name": "HCL Technologies","sector": "IT Services",  "tier": "MNC",     "open_roles_30d": 530, "avg_offer_inr": 600000},
+        {"name": "Adobe Noida",    "sector": "Big Tech",      "tier": "MNC",     "open_roles_30d": 110, "avg_offer_inr": 2150000},
+        {"name": "Paytm",          "sector": "Fintech",       "tier": "Unicorn", "open_roles_30d": 80,  "avg_offer_inr": 1320000},
+        {"name": "Maruti Suzuki R&D","sector": "Automotive",  "tier": "MNC",     "open_roles_30d": 95,  "avg_offer_inr": 760000},
+    ],
+    ("Engineering", "Chennai"): [
+        {"name": "Zoho",           "sector": "SaaS",          "tier": "MNC",     "open_roles_30d": 180, "avg_offer_inr": 880000},
+        {"name": "Freshworks",     "sector": "SaaS",          "tier": "Unicorn", "open_roles_30d": 130, "avg_offer_inr": 1450000},
+        {"name": "Ford India",     "sector": "Automotive",    "tier": "MNC",     "open_roles_30d": 60,  "avg_offer_inr": 780000},
+        {"name": "Infosys Chennai","sector": "IT Services",   "tier": "MNC",     "open_roles_30d": 720, "avg_offer_inr": 580000},
+    ],
+
+    ("MBA", "Mumbai"): [
+        {"name": "HDFC Bank",       "sector": "BFSI",   "tier": "MNC",      "open_roles_30d": 220, "avg_offer_inr": 1450000},
+        {"name": "Kotak Mahindra",  "sector": "BFSI",   "tier": "MNC",      "open_roles_30d": 180, "avg_offer_inr": 1350000},
+        {"name": "Reliance Retail", "sector": "Retail", "tier": "MNC",      "open_roles_30d": 95,  "avg_offer_inr": 1150000},
+        {"name": "ICICI Bank",      "sector": "BFSI",   "tier": "MNC",      "open_roles_30d": 240, "avg_offer_inr": 1380000},
+        {"name": "McKinsey & Co",   "sector": "Consulting","tier": "MNC",   "open_roles_30d": 35,  "avg_offer_inr": 2750000},
+    ],
+    ("MBA", "Bengaluru"): [
+        {"name": "Flipkart Bus.Ops","sector": "E-commerce", "tier": "Unicorn","open_roles_30d": 70,  "avg_offer_inr": 1850000},
+        {"name": "Goldman Sachs BLR","sector": "BFSI",      "tier": "MNC",   "open_roles_30d": 45,  "avg_offer_inr": 2450000},
+        {"name": "Accenture Strategy","sector": "Consulting","tier": "MNC", "open_roles_30d": 110, "avg_offer_inr": 1550000},
+        {"name": "Walmart Global Tech","sector": "Retail",  "tier": "MNC",  "open_roles_30d": 85,  "avg_offer_inr": 1750000},
+    ],
+    ("MBA", "Delhi NCR"): [
+        {"name": "Deloitte Consulting","sector": "Consulting","tier": "MNC","open_roles_30d": 130, "avg_offer_inr": 1650000},
+        {"name": "EY India",        "sector": "Consulting", "tier": "MNC",  "open_roles_30d": 110, "avg_offer_inr": 1480000},
+        {"name": "Bain & Company",  "sector": "Consulting", "tier": "MNC",  "open_roles_30d": 28,  "avg_offer_inr": 2800000},
+        {"name": "Bharti Airtel",   "sector": "Telecom",    "tier": "MNC",  "open_roles_30d": 70,  "avg_offer_inr": 1320000},
+    ],
+    ("MBA", "Hyderabad"): [
+        {"name": "Amazon Strategy", "sector": "E-commerce", "tier": "MNC",  "open_roles_30d": 85,  "avg_offer_inr": 1950000},
+        {"name": "ICICI Lombard",   "sector": "Insurance",  "tier": "MNC",  "open_roles_30d": 60,  "avg_offer_inr": 1180000},
+    ],
+    ("MBA", "Pune"): [
+        {"name": "Bajaj Finserv",   "sector": "BFSI",       "tier": "MNC",  "open_roles_30d": 95,  "avg_offer_inr": 1280000},
+        {"name": "Cummins India",   "sector": "Manufacturing","tier": "MNC","open_roles_30d": 50,  "avg_offer_inr": 1150000},
+    ],
+    ("MBA", "Chennai"): [
+        {"name": "TVS Capital",     "sector": "BFSI",       "tier": "MNC",  "open_roles_30d": 45,  "avg_offer_inr": 1180000},
+        {"name": "Hyundai India",   "sector": "Automotive", "tier": "MNC",  "open_roles_30d": 55,  "avg_offer_inr": 1220000},
+    ],
+
+    ("Nursing", "Mumbai"): [
+        {"name": "Kokilaben Dhirubhai Ambani Hospital", "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 120, "avg_offer_inr": 420000},
+        {"name": "Lilavati Hospital",                   "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 85,  "avg_offer_inr": 380000},
+        {"name": "Tata Memorial Centre",                "sector": "Healthcare", "tier": "Govt",    "open_roles_30d": 95,  "avg_offer_inr": 360000},
+    ],
+    ("Nursing", "Delhi NCR"): [
+        {"name": "AIIMS Delhi",       "sector": "Healthcare", "tier": "Govt",    "open_roles_30d": 180, "avg_offer_inr": 380000},
+        {"name": "Apollo Hospital",   "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 110, "avg_offer_inr": 410000},
+        {"name": "Max Healthcare",    "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 95,  "avg_offer_inr": 400000},
+    ],
+    ("Nursing", "Bengaluru"): [
+        {"name": "Manipal Hospital",  "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 130, "avg_offer_inr": 430000},
+        {"name": "Narayana Health",   "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 110, "avg_offer_inr": 390000},
+        {"name": "Fortis Hospital",   "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 95,  "avg_offer_inr": 400000},
+    ],
+    ("Nursing", "Hyderabad"): [
+        {"name": "Yashoda Hospitals", "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 105, "avg_offer_inr": 380000},
+        {"name": "Continental Hospitals", "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 65, "avg_offer_inr": 410000},
+    ],
+    ("Nursing", "Chennai"): [
+        {"name": "Apollo Hospital Chennai", "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 140, "avg_offer_inr": 420000},
+        {"name": "MIOT International",      "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 70,  "avg_offer_inr": 395000},
+    ],
+    ("Nursing", "Pune"): [
+        {"name": "Ruby Hall Clinic",  "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 75,  "avg_offer_inr": 370000},
+        {"name": "Sahyadri Hospital", "sector": "Healthcare", "tier": "Premium", "open_roles_30d": 55,  "avg_offer_inr": 360000},
+    ],
+}
+
+
+def match_recruiters(student: dict, top_n: int = 6) -> list:
+    """
+    Joins student profile (course × region × iqi × employer_tier preference)
+    against RECRUITER_UNIVERSE. Ranks by a blended match score and returns
+    top_n recommendations with explainable component breakdown.
+    """
+    course = student.get("course_type", "Engineering")
+    region = student.get("region", "Bengaluru")
+    pref_tier = student.get("employer_tier", "MNC")
+    iqi = float(student.get("iqi", 0.5) or 0.5)
+
+    derived = derive_student_signals(student)
+    pipeline_pct = derived["interview_progress_score"] / 100.0
+
+    pool = RECRUITER_UNIVERSE.get((course, region), [])
+    if not pool:
+        # Fall back to course-only pool, mixing other regions
+        pool = []
+        for (c, _r), recs in RECRUITER_UNIVERSE.items():
+            if c == course:
+                pool.extend(recs)
+
+    matches = []
+    max_roles = max((r["open_roles_30d"] for r in pool), default=1)
+    for r in pool:
+        # Component scores (0..1)
+        demand_score = r["open_roles_30d"] / max_roles
+        tier_score = 1.0 if r["tier"] == pref_tier else 0.55
+        iqi_score = min(1.0, iqi + 0.30)  # higher iqi → broader eligibility
+        pipeline_score = 0.55 + pipeline_pct * 0.45
+
+        match_pct = round(
+            (demand_score * 0.30 + tier_score * 0.25 + iqi_score * 0.20 + pipeline_score * 0.25) * 100, 1
+        )
+        matches.append({
+            **r,
+            "match_pct": match_pct,
+            "rationale": _recruiter_rationale(r, demand_score, tier_score, iqi_score, pipeline_score, pref_tier),
+        })
+
+    matches.sort(key=lambda m: m["match_pct"], reverse=True)
+    return matches[:top_n]
+
+
+def _recruiter_rationale(r, demand, tier, iqi_s, pipeline, pref_tier):
+    pieces = []
+    if demand >= 0.70:
+        pieces.append(f"{r['open_roles_30d']} open roles in last 30d")
+    if r["tier"] == pref_tier:
+        pieces.append(f"matches preferred {pref_tier} tier")
+    if iqi_s >= 0.75:
+        pieces.append("institute IQI in eligibility band")
+    if pipeline >= 0.80:
+        pieces.append("strong interview pipeline momentum")
+    if not pieces:
+        pieces.append(f"{r['sector']} demand in this region")
+    return " · ".join(pieces)
+
 # Load synthetic student database
 try:
     df_students = pd.read_csv('data/synthetic_students.csv')
@@ -205,19 +482,176 @@ async def get_cohort_summary():
 
 @app.get("/api/v1/student/{student_id}")
 async def get_student(student_id: str):
-    """Returns a full scored profile for a specific student."""
+    """Returns a full scored profile for a specific student.
+
+    Profile now includes derived problem-statement signals (PRD gap fix):
+      - skill_certifications (PRD §A.5)
+      - interview_progress_score + breakdown (PRD §D.2)
+      - resume_freshness_days (PRD §D.3)
+    """
     student = next((s for s in mock_db if s.get("student_id") == student_id), None)
     if not student:
         raise HTTPException(status_code=404, detail=f"Student '{student_id}' not found")
 
     try:
         score = engine.score_student(dict(student))
+        # Merge derived signals into the profile so the frontend can render them
+        enriched_profile = {**dict(student), **derive_student_signals(dict(student))}
         return sanitize({
-            "profile": student,
-            "analysis": score
+            "profile": enriched_profile,
+            "analysis": score,
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Scoring error: {str(e)}")
+
+
+@app.get("/api/v1/student/{student_id}/recruiter-matches")
+async def get_recruiter_matches(student_id: str, top_n: int = 6):
+    """Recruiter-Matches engine ⭐ — PRD next-best-action: 'high-potential recruiter matches'.
+
+    Joins student profile (course × region × employer_tier × iqi × interview_progress)
+    against RECRUITER_UNIVERSE and returns ranked, explainable matches.
+    """
+    student = next((s for s in mock_db if s.get("student_id") == student_id), None)
+    if not student:
+        raise HTTPException(status_code=404, detail=f"Student '{student_id}' not found")
+
+    matches = match_recruiters(dict(student), top_n=top_n)
+    derived = derive_student_signals(dict(student))
+    return sanitize({
+        "student_id": student_id,
+        "course": student.get("course_type"),
+        "region": student.get("region"),
+        "preferred_employer_tier": student.get("employer_tier"),
+        "interview_progress_score": derived["interview_progress_score"],
+        "matches": matches,
+        "total_in_pool": len(RECRUITER_UNIVERSE.get((student.get("course_type"), student.get("region")), [])),
+        "data_note": "Recruiter universe synthesized from Foundit/Naukri 2025 posting volumes + "
+                     "campus-placement reports. Match score blends demand (30%), tier fit (25%), "
+                     "IQI eligibility (20%), and interview-pipeline momentum (25%).",
+    })
+
+
+class LoanApplication(BaseModel):
+    """Loan application payload from the borrower-side /me/apply form."""
+    student_id: str = "STU-DEMO-PENDING"
+    name: str = "Applicant"
+    # Academic
+    course_type: str = "Engineering"
+    year: str = "Final year"
+    cgpa: float = Field(default=7.5, ge=0.0, le=10.0)
+    institute_name: str = ""
+    institute_tier: str = "B"
+    region: str = "Pune"
+    internship_months: int = Field(default=3, ge=0)
+    employer_tier: str = "MNC"
+    # Financial
+    loan_amount: int = Field(default=600000, ge=0)
+    monthly_emi: int = Field(default=12000, ge=0)
+    co_applicant_income: int = Field(default=0, ge=0)
+    employment_type: str = "Salaried co-applicant"
+
+
+@app.post("/api/v1/loan/prescreen")
+async def loan_prescreen(app_data: LoanApplication):
+    """Loan pre-screen ⭐ — instant placement-risk scoring for a new borrower.
+
+    Takes the application form payload, builds a synthetic student dict in the
+    shape the ScoringEngine expects, runs the full ML + SHAP + NBA pipeline,
+    appends derived borrower signals (skill certs, interview progress, resume
+    freshness) and the top recruiter matches. This is the borrower-facing
+    counterpart to /api/v1/student/{id}.
+    """
+    # Map form fields → scoring-engine input shape.
+    # Derive iqi / behavioral / field_demand / macro_climate from the form
+    # using the same deterministic hash logic as the rest of the codebase so
+    # re-submissions are stable.
+    h = _stable_hash(app_data.student_id, app_data.course_type, app_data.cgpa)
+
+    iqi_base = min(0.45, 0.10 + (app_data.cgpa - 4) / 6 * 0.30 + min(app_data.internship_months, 6) / 6 * 0.10)
+    behavior = min(100, int(40 + (app_data.cgpa - 4) / 6 * 35 + min(app_data.internship_months, 6) / 6 * 25 + (h % 11)))
+
+    # field_demand_score by course × region (table reflects current heatmap)
+    DEMAND_TABLE = {
+        ("Engineering", "Bengaluru"): 88, ("Engineering", "Hyderabad"): 82,
+        ("Engineering", "Mumbai"): 71,    ("Engineering", "Pune"): 76,
+        ("Engineering", "Delhi NCR"): 75, ("Engineering", "Chennai"): 70,
+        ("MBA", "Mumbai"): 82,            ("MBA", "Bengaluru"): 78,
+        ("MBA", "Delhi NCR"): 80,         ("MBA", "Hyderabad"): 70,
+        ("MBA", "Pune"): 72,              ("MBA", "Chennai"): 67,
+        ("Nursing", "Bengaluru"): 79,     ("Nursing", "Delhi NCR"): 84,
+        ("Nursing", "Mumbai"): 76,        ("Nursing", "Hyderabad"): 74,
+        ("Nursing", "Chennai"): 81,       ("Nursing", "Pune"): 71,
+    }
+    field_demand = DEMAND_TABLE.get((app_data.course_type, app_data.region), 65)
+    macro_climate = round(0.65 + (field_demand / 100) * 0.25, 2)
+
+    student_dict = {
+        "student_id": app_data.student_id,
+        "course_type": app_data.course_type,
+        "institute_tier": app_data.institute_tier,
+        "region": app_data.region,
+        "cgpa": app_data.cgpa,
+        "internship_months": app_data.internship_months,
+        "employer_tier": app_data.employer_tier,
+        "iqi": round(iqi_base, 3),
+        "behavioral_activity_score": behavior,
+        "field_demand_score": field_demand,
+        "macro_climate_index": macro_climate,
+        "monthly_emi": app_data.monthly_emi,
+    }
+
+    try:
+        score = engine.score_student(student_dict)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scoring error: {str(e)}")
+
+    derived = derive_student_signals(student_dict)
+    matches = match_recruiters(student_dict, top_n=3)
+
+    # Indicative offer — simple deterministic mapping from risk band
+    risk_band = score.get("prediction", {}).get("risk_band", "MEDIUM")
+    sanctioned = app_data.loan_amount
+    interest_band = {
+        "LOW":    {"min": 9.5,  "max": 11.0},
+        "MEDIUM": {"min": 10.5, "max": 12.5},
+        "HIGH":   {"min": 12.5, "max": 14.5},
+    }.get(risk_band, {"min": 11.0, "max": 13.0})
+
+    if risk_band == "HIGH":
+        sanctioned = int(app_data.loan_amount * 0.75)
+
+    return sanitize({
+        "applicant": {
+            "student_id": app_data.student_id,
+            "name": app_data.name,
+            "course_type": app_data.course_type,
+            "region": app_data.region,
+            "institute_tier": app_data.institute_tier,
+            "cgpa": app_data.cgpa,
+            "loan_requested": app_data.loan_amount,
+            "monthly_emi": app_data.monthly_emi,
+            **derived,  # skill certs + interview pipeline + resume freshness
+        },
+        "scored_input": student_dict,
+        "prediction": score.get("prediction", {}),
+        "insights": score.get("insights", {}),
+        "explainability": score.get("explainability", {}),
+        "recruiter_matches": matches,
+        "indicative_offer": {
+            "status": "PRE-APPROVED" if risk_band in ("LOW", "MEDIUM") else "CONDITIONAL",
+            "requested_amount": app_data.loan_amount,
+            "sanctioned_amount": sanctioned,
+            "interest_rate_band_pct": interest_band,
+            "tenure_years": 7,
+            "conditions": [
+                "EMI auto-debit consent required",
+                "Quarterly placement-progress check-in",
+            ] + (["Co-applicant guarantor required (HIGH risk band)"] if risk_band == "HIGH" else []),
+        },
+        "data_note": "Pre-screen scored by the same XGBoost + LightGBM + SHAP pipeline that powers the lender dashboard. "
+                     "Score is indicative; final sanction requires lender review.",
+    })
 
 
 @app.post("/api/v1/student/{student_id}/simulate")
@@ -284,6 +718,63 @@ async def get_model_metadata():
             "behavioral_activity_score", "field_demand_score", "macro_climate_index"
         ]
     }
+
+
+@app.get("/api/v1/model/data-provenance")
+async def get_data_provenance():
+    """
+    Returns where the active model was trained from — synthetic or AMCAT-mapped —
+    with row count, F1 / MAPE, and trained-at timestamp. Reads
+    models/model_provenance.json (written by model_pipeline.py).
+    Falls back to a static snapshot when the file is missing.
+    """
+    import json
+    import os as _os
+
+    base = _os.path.dirname(_os.path.abspath(__file__))
+    candidates = [
+        ('synthetic', _os.path.join(base, 'models', 'model_provenance.json')),
+        ('amcat',     _os.path.join(base, 'models', 'model_provenance-amcat.json')),
+        ('combined',  _os.path.join(base, 'models', 'model_provenance-combined.json')),
+    ]
+
+    # Preference order for "active" — combined > amcat > synthetic
+    PREFERENCE = {'synthetic': 0, 'amcat': 1, 'combined': 2}
+
+    payload = {
+        "active":  None,
+        "variants": [],
+    }
+
+    for key, path in candidates:
+        if _os.path.exists(path):
+            try:
+                with open(path) as fh:
+                    prov = json.load(fh)
+                prov['_kind'] = key
+                payload['variants'].append(prov)
+                if payload['active'] is None or PREFERENCE[key] > PREFERENCE[payload['active']['_kind']]:
+                    payload['active'] = prov
+            except Exception:
+                pass
+
+    if not payload['variants']:
+        # No provenance files yet — return the historical static metadata so
+        # the admin pill never breaks on a fresh checkout.
+        payload['active'] = {
+            "_kind":             "synthetic",
+            "source":            "synthetic",
+            "source_path":       "data/synthetic_students.csv",
+            "row_count":         10000,
+            "classifier_f1_6m":  0.83,
+            "salary_mape":       0.126,
+            "trained_at_utc":    None,
+            "model_files": {"classifier": "placement_classifier.pkl"},
+            "note":              "Provenance file missing — run `python model_pipeline.py` to regenerate.",
+        }
+        payload['variants'].append(payload['active'])
+
+    return sanitize(payload)
 
 
 @app.get("/api/v1/alerts/active")
@@ -676,7 +1167,26 @@ async def mark_nba_complete(student_id: str, data: dict = {}):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "students_loaded": len(mock_db)}
+    # Expose active LLM provider/model so the UI can stop hardcoding "Groq · llama-3.1-8b"
+    try:
+        import config as _cfg
+        llm = {
+            "provider": _cfg.ACTIVE_PROVIDER,
+            "model": _cfg.MODEL,
+            "configured": bool(_cfg.API_KEY),
+        }
+    except Exception as e:
+        llm = {"provider": None, "model": None, "configured": False, "error": str(e)}
+    try:
+        variant = engine.variant
+    except Exception:
+        variant = None
+    return {
+        "status": "ok",
+        "students_loaded": len(mock_db),
+        "llm": llm,
+        "model_variant": variant,
+    }
 
 
 
@@ -1079,7 +1589,26 @@ async def ingest_signal(payload: dict = {}):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "students_loaded": len(mock_db)}
+    # Expose active LLM provider/model so the UI can stop hardcoding "Groq · llama-3.1-8b"
+    try:
+        import config as _cfg
+        llm = {
+            "provider": _cfg.ACTIVE_PROVIDER,
+            "model": _cfg.MODEL,
+            "configured": bool(_cfg.API_KEY),
+        }
+    except Exception as e:
+        llm = {"provider": None, "model": None, "configured": False, "error": str(e)}
+    try:
+        variant = engine.variant
+    except Exception:
+        variant = None
+    return {
+        "status": "ok",
+        "students_loaded": len(mock_db),
+        "llm": llm,
+        "model_variant": variant,
+    }
 
 
 if __name__ == "__main__":

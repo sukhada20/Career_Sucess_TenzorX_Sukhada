@@ -4,7 +4,8 @@ import axios from 'axios';
 import {
   ArrowLeft, User, Shield, Briefcase, Zap,
   CheckCircle2, AlertOctagon, Target, TrendingUp,
-  Clock, ChevronRight, Activity, Play, Map, Building2, Info, Brain
+  Clock, ChevronRight, Activity, Play, Map, Building2, Info, Brain,
+  Award, MessageSquare, FileText, Handshake, IndianRupee
 } from 'lucide-react';
 import { API_BASE } from '../App';
 
@@ -182,6 +183,286 @@ function InterventionSimulator({ studentId, studentData }) {
   );
 }
 
+// ─── Career Readiness Signals — fills PRD §A.5, §D.2, §D.3 gaps ──────────
+function CareerReadinessRow({ profile }) {
+  const certs = profile.skill_certifications || [];
+  const certCount = profile.skill_certs_count ?? certs.length;
+  const ipScore = profile.interview_progress_score ?? 0;
+  const stages = profile.interview_stages_30d || {};
+  const totalScheduled = profile.interviews_scheduled_30d ?? 0;
+  const cleared = profile.interviews_cleared_30d ?? 0;
+  const freshness = profile.resume_freshness_days ?? null;
+  const freshLabel = profile.resume_last_updated_label || '—';
+
+  const ipColor = ipScore >= 70 ? 'var(--risk-low)' : ipScore >= 40 ? 'var(--risk-medium)' : 'var(--risk-high)';
+  const freshColor = (freshness ?? 999) <= 14 ? 'var(--risk-low)' : (freshness ?? 999) <= 45 ? 'var(--risk-medium)' : 'var(--risk-high)';
+
+  return (
+    <div className="grid-3" style={{ marginBottom: '1.5rem' }}>
+      {/* Skill certifications */}
+      <div className="card" style={{ borderTop: '2px solid var(--navy)' }}>
+        <div className="card-title"><Award size={13} /> Skill Certifications · §A.5</div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.55rem', marginBottom: '0.85rem' }}>
+          <span style={{
+            fontFamily: 'var(--font-display)', fontWeight: 400,
+            fontSize: '2.6rem', lineHeight: 1,
+            fontVariationSettings: '"opsz" 144',
+            letterSpacing: '-0.04em',
+            color: 'var(--ink)',
+            fontFeatureSettings: '"tnum"',
+          }}>{certCount}</span>
+          <span style={{ fontSize: '0.7rem', color: 'var(--ink-faint)', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+            held
+          </span>
+        </div>
+        {certs.length === 0 ? (
+          <div style={{ fontSize: '0.82rem', color: 'var(--ink-faint)', fontStyle: 'italic' }}>
+            No certifications on file. Recommended: 2–3 field-relevant certs.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+            {certs.map((c, i) => (
+              <div key={i} style={{
+                fontSize: '0.82rem',
+                color: 'var(--ink-soft)',
+                display: 'flex', alignItems: 'center', gap: '8px',
+                paddingBottom: '0.35rem',
+                borderBottom: i < certs.length - 1 ? '1px solid var(--rule)' : 'none',
+              }}>
+                <CheckCircle2 size={12} style={{ color: 'var(--risk-low)', flexShrink: 0 }} />
+                <span>{c}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Interview pipeline */}
+      <div className="card" style={{ borderTop: `2px solid ${ipColor}` }}>
+        <div className="card-title"><MessageSquare size={13} /> Interview Pipeline · §D.2</div>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: '0.85rem' }}>
+          <span style={{
+            fontFamily: 'var(--font-display)', fontWeight: 400,
+            fontSize: '2.6rem', lineHeight: 1,
+            fontVariationSettings: '"opsz" 144',
+            letterSpacing: '-0.04em',
+            color: ipColor,
+            fontFeatureSettings: '"tnum"',
+          }}>{ipScore}
+            <span style={{ fontSize: '0.7rem', color: 'var(--ink-faint)', fontFamily: 'var(--font-sans)', marginLeft: '3px', letterSpacing: '0' }}>/100</span>
+          </span>
+          <span style={{
+            fontSize: '0.7rem',
+            fontFamily: 'var(--font-mono)',
+            color: 'var(--ink-muted)',
+            fontFeatureSettings: '"tnum"',
+            textAlign: 'right',
+            lineHeight: 1.3,
+          }}>
+            <div>{totalScheduled} sched / 30d</div>
+            <div>{cleared} cleared</div>
+          </span>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+          {[
+            ['Screening', stages.screening || 0],
+            ['Technical', stages.technical || 0],
+            ['Final round', stages.final || 0],
+            ['Offer stage', stages.offer || 0],
+          ].map(([label, v]) => {
+            const max = Math.max(totalScheduled, 1);
+            return (
+              <div key={label}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.74rem', marginBottom: '3px' }}>
+                  <span style={{ color: 'var(--ink-muted)' }}>{label}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--ink)', fontFeatureSettings: '"tnum"' }}>{v}</span>
+                </div>
+                <div className="progress-bar-track" style={{ height: '3px', marginTop: 0 }}>
+                  <div className="progress-bar-fill" style={{ width: `${(v / max) * 100}%`, background: ipColor }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Resume freshness */}
+      <div className="card" style={{ borderTop: `2px solid ${freshColor}` }}>
+        <div className="card-title"><FileText size={13} /> Resume Freshness · §D.3</div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.55rem', marginBottom: '0.55rem' }}>
+          <span style={{
+            fontFamily: 'var(--font-display)', fontWeight: 400,
+            fontSize: '2.6rem', lineHeight: 1,
+            fontVariationSettings: '"opsz" 144',
+            letterSpacing: '-0.04em',
+            color: freshColor,
+            fontFeatureSettings: '"tnum"',
+          }}>{freshness ?? '—'}</span>
+          <span style={{ fontSize: '0.7rem', color: 'var(--ink-faint)', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+            days
+          </span>
+        </div>
+        <div style={{ fontSize: '0.86rem', color: 'var(--ink-soft)', marginBottom: '0.85rem' }}>
+          Last updated <strong style={{ color: 'var(--ink)' }}>{freshLabel}</strong>
+        </div>
+        <div className="progress-bar-track" style={{ height: '5px' }}>
+          <div className="progress-bar-fill" style={{
+            width: `${Math.max(5, 100 - ((freshness ?? 60) / 120) * 100)}%`,
+            background: freshColor,
+          }} />
+        </div>
+        <div style={{
+          marginTop: '0.6rem',
+          fontSize: '0.7rem',
+          color: 'var(--ink-faint)',
+          fontStyle: 'italic',
+        }}>
+          {(freshness ?? 999) > 30
+            ? 'Stale — flag for resume-refresh outreach.'
+            : 'Within healthy window.'}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Recruiter Matches Tab — fills NBA recruiter-matches gap ──────────────
+function RecruiterMatchesTab({ studentId }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    axios.get(`${API_BASE}/api/v1/student/${studentId}/recruiter-matches?top_n=8`)
+      .then(r => setData(r.data))
+      .catch(() => setData(null))
+      .finally(() => setLoading(false));
+  }, [studentId]);
+
+  if (loading) return (
+    <div className="card" style={{ padding: '2rem', color: 'var(--ink-muted)' }}>
+      <Activity size={14} style={{ animation: 'spin 1s linear infinite', marginRight: '0.5rem', verticalAlign: '-2px' }} />
+      Computing recruiter matches…
+    </div>
+  );
+  if (!data) return <div className="card" style={{ padding: '2rem', color: 'var(--risk-high)' }}>Failed to load recruiter matches.</div>;
+
+  const matchColor = (pct) => pct >= 75 ? 'var(--risk-low)' : pct >= 60 ? 'var(--risk-medium)' : 'var(--risk-high)';
+
+  return (
+    <div className="card">
+      <div className="card-title" style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><Handshake size={14} /> Recruiter Matches · NBA §A.2</div>
+        <span className="agentic-badge">High-Potential Match</span>
+      </div>
+      <p style={{ fontSize: '0.85rem', color: 'var(--ink-muted)', marginBottom: '1.1rem', maxWidth: '64ch' }}>
+        Ranked recruiter recommendations for <strong style={{ color: 'var(--ink)' }}>{data.course} · {data.region}</strong>{' '}
+        — blends 30-day demand (30%), tier fit (25%), IQI eligibility (20%), interview-pipeline momentum (25%).
+      </p>
+
+      <div className="grid-2" style={{ gap: '0.85rem' }}>
+        {data.matches?.map((m, i) => (
+          <div key={i} style={{
+            position: 'relative',
+            padding: '1.1rem 1.2rem',
+            background: 'var(--card-raised)',
+            border: '1px solid var(--card-edge)',
+            borderLeft: `3px solid ${matchColor(m.match_pct)}`,
+            borderRadius: '2px',
+            transition: 'border-color 0.2s, transform 0.2s',
+          }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--card-edge-strong)'; e.currentTarget.style.borderLeftColor = matchColor(m.match_pct); e.currentTarget.style.transform = 'translateY(-1px)'; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--card-edge)'; e.currentTarget.style.borderLeftColor = matchColor(m.match_pct); e.currentTarget.style.transform = 'translateY(0)'; }}
+          >
+            <div style={{ position: 'absolute', top: '0.7rem', right: '0.95rem' }}>
+              <span className="serial" style={{ fontSize: '0.7rem' }}>№ {String(i + 1).padStart(2, '0')}</span>
+            </div>
+
+            <div style={{
+              fontFamily: 'var(--font-sans)',
+              fontSize: '0.6rem',
+              fontWeight: 700,
+              letterSpacing: '0.20em',
+              textTransform: 'uppercase',
+              color: 'var(--ink-faint)',
+              marginBottom: '0.4rem',
+            }}>
+              {m.sector} · {m.tier}
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '0.75rem', marginBottom: '0.7rem' }}>
+              <h4 style={{
+                fontFamily: 'var(--font-display)',
+                fontWeight: 400,
+                fontSize: '1.3rem',
+                fontVariationSettings: '"opsz" 72',
+                letterSpacing: '-0.02em',
+                color: 'var(--ink)',
+                margin: 0,
+                lineHeight: 1.1,
+                flex: 1,
+              }}>{m.name}</h4>
+              <span style={{
+                fontFamily: 'var(--font-display)',
+                fontSize: '1.75rem',
+                fontWeight: 400,
+                fontVariationSettings: '"opsz" 96',
+                letterSpacing: '-0.03em',
+                color: matchColor(m.match_pct),
+                fontFeatureSettings: '"tnum"',
+                lineHeight: 1,
+              }}>
+                {Math.round(m.match_pct)}
+                <span style={{ fontSize: '0.6rem', color: 'var(--ink-faint)', fontFamily: 'var(--font-sans)', marginLeft: '2px', letterSpacing: '0' }}>%</span>
+              </span>
+            </div>
+
+            <div style={{
+              display: 'flex', gap: '1.1rem',
+              paddingBottom: '0.65rem',
+              borderBottom: '1px solid var(--rule)',
+              marginBottom: '0.6rem',
+              fontSize: '0.78rem',
+              color: 'var(--ink-muted)',
+            }}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
+                <Briefcase size={11} />
+                <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--ink)', fontFeatureSettings: '"tnum"' }}>{m.open_roles_30d}</span> open · 30d
+              </span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
+                <IndianRupee size={11} />
+                <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--ink)', fontFeatureSettings: '"tnum"' }}>
+                  {(m.avg_offer_inr / 100000).toFixed(1)}L
+                </span> avg offer
+              </span>
+            </div>
+
+            <div style={{
+              fontSize: '0.78rem',
+              color: 'var(--ink-soft)',
+              fontStyle: 'italic',
+              lineHeight: 1.45,
+            }}>
+              {m.rationale}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{
+        marginTop: '1rem',
+        paddingTop: '0.85rem',
+        borderTop: '1px solid var(--rule)',
+        fontSize: '0.7rem',
+        color: 'var(--ink-faint)',
+        fontStyle: 'italic',
+      }}>
+        {data.data_note}
+      </div>
+    </div>
+  );
+}
+
 function StudentProfile() {
   const { id } = useParams();
   const [data, setData] = useState(null);
@@ -216,8 +497,9 @@ function StudentProfile() {
     { id: 'explainability', label: 'AI Explainability' },
     { id: 'simulator', label: 'Intervention Simulator ⭐' },
     { id: 'peer', label: 'Peer Benchmark ⭐' },
-    { id: 'career', label: '🗺 Career Paths ⭐' },
-    { id: 'offer', label: '🛡 Offer Survival ⭐' },
+    { id: 'recruiters', label: 'Recruiter Matches ⭐' },
+    { id: 'career', label: 'Career Paths ⭐' },
+    { id: 'offer', label: 'Offer Survival ⭐' },
   ];
 
   return (
@@ -296,6 +578,9 @@ function StudentProfile() {
           <ProbabilityHorizon label="12 Months" value={pred.placement_probability['12m']} />
         </div>
       </div>
+
+      {/* Career Readiness Signals — closes PRD §A.5 / §D.2 / §D.3 gaps */}
+      <CareerReadinessRow profile={profile} />
 
       {/* Tab Navigation */}
       <div className="tabs">
@@ -413,6 +698,10 @@ function StudentProfile() {
             ))}
           </div>
         </div>
+      )}
+
+      {activeTab === 'recruiters' && (
+        <RecruiterMatchesTab studentId={id} />
       )}
 
       {activeTab === 'career' && (

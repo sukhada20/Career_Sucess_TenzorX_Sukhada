@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { Settings, Shield, Zap, ChevronDown, ChevronUp, Save, RefreshCw, CheckCircle, Users } from 'lucide-react';
+import { Settings, Shield, Zap, ChevronDown, ChevronUp, Save, RefreshCw, CheckCircle, Users, Database } from 'lucide-react';
 import { API_BASE } from '../App';
 
 function ConfigSection({ title, icon: Icon, children, defaultOpen = false }) {
@@ -42,11 +42,13 @@ function Admin() {
   const [saved, setSaved] = useState(false);
   const [ccData, setCcData] = useState(null);
   const [fairness, setFairness] = useState(null);
+  const [provenance, setProvenance] = useState(null);
 
   useEffect(() => {
     axios.get(`${API_BASE}/api/v1/admin/config`).then(r => setConfig(r.data)).catch(() => {});
     axios.get(`${API_BASE}/api/v1/model/champion-challenger`).then(r => setCcData(r.data)).catch(() => {});
     axios.get(`${API_BASE}/api/v1/model/fairness`).then(r => setFairness(r.data)).catch(() => {});
+    axios.get(`${API_BASE}/api/v1/model/data-provenance`).then(r => setProvenance(r.data)).catch(() => {});
   }, []);
 
   const save = async () => {
@@ -198,6 +200,62 @@ function Admin() {
           </tbody>
         </table>
       </ConfigSection>
+
+      {/* Data Provenance — what the active model was trained from */}
+      {provenance?.active && (() => {
+        const a = provenance.active;
+        const KIND_META = {
+          combined:  { label: 'AMCAT + SYNTHETIC · combined',  badge: 'badge-low'    },
+          amcat:     { label: 'AMCAT · real outcomes',         badge: 'badge-low'    },
+          synthetic: { label: 'SYNTHETIC · generated',         badge: 'badge-medium' },
+        };
+        const meta = KIND_META[a._kind] || KIND_META.synthetic;
+        const mix = a.origin_mix || null;
+        return (
+          <div className="card" style={{ marginBottom: '1rem', borderLeft: '3px solid var(--signal)' }}>
+            <div className="card-title"><Database size={14} /> Training Data Provenance</div>
+            <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap', marginTop: '0.5rem' }}>
+              <span className={`badge ${meta.badge}`} style={{ fontFamily: 'var(--font-mono)', letterSpacing: '0.10em' }}>
+                {meta.label}
+              </span>
+              <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+                <strong>{(a.row_count || 0).toLocaleString('en-IN')}</strong> records
+                {mix && (
+                  <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginLeft: '0.4em', fontFamily: 'var(--font-mono)' }}>
+                    ({Object.entries(mix).map(([k, v]) => `${k.slice(0,3)} ${v.toLocaleString('en-IN')}`).join(' + ')})
+                  </span>
+                )}
+              </span>
+              <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+                F1 (6m): <strong className="mono">{(a.classifier_f1_6m ?? 0).toFixed(3)}</strong>
+              </span>
+              <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+                MAPE: <strong className="mono">{a.salary_mape != null ? `${(a.salary_mape * 100).toFixed(1)}%` : '—'}</strong>
+              </span>
+              {a.median_salary_inr ? (
+                <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+                  Median CTC: <strong className="mono">₹{a.median_salary_inr.toLocaleString('en-IN')}</strong>
+                </span>
+              ) : null}
+              {a.trained_at_utc && (
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                  trained {a.trained_at_utc.slice(0, 10)}
+                </span>
+              )}
+            </div>
+            {provenance.variants?.length > 1 && (
+              <div style={{ marginTop: '0.75rem', fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                {provenance.variants.length} variants on disk · A/B-switchable via <span className="mono">backend/scoring_engine.py</span>. Active preference: combined &gt; amcat &gt; synthetic.
+              </div>
+            )}
+            {a.note && (
+              <div style={{ marginTop: '0.5rem', fontSize: '0.74rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                {a.note}
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Model Config */}
       <ConfigSection title="Model Configuration & Champion/Challenger" icon={Zap}>

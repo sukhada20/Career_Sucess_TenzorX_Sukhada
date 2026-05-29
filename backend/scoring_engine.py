@@ -1,14 +1,34 @@
 import math
+import os
 import joblib
 import pandas as pd
 import numpy as np
 
+# Preference order matches the admin Data Provenance card:
+# `combined` has the salary-scale fix (synthetic ×12 + AMCAT annual) so it must
+# win over the synthetic-only baseline whose salary head is 12× too low.
+_VARIANT_PREFERENCE = ['-combined', '-amcat', '']
+
+
+def _pick_variant(models_dir: str) -> str:
+    for suffix in _VARIANT_PREFERENCE:
+        if os.path.exists(f'{models_dir}/placement_classifier{suffix}.pkl'):
+            return suffix
+    raise FileNotFoundError(
+        f"No trained model variant found in {models_dir}/. "
+        f"Run `python model_pipeline.py --source combined` first."
+    )
+
+
 class ScoringEngine:
     def __init__(self, models_dir='models'):
-        self.clf = joblib.load(f'{models_dir}/placement_classifier.pkl')
-        self.reg = joblib.load(f'{models_dir}/salary_regressor.pkl')
-        self.encoders = joblib.load(f'{models_dir}/encoders.pkl')
-        self.explainer = joblib.load(f'{models_dir}/shap_explainer.pkl')
+        suffix = _pick_variant(models_dir)
+        self.variant = suffix or 'synthetic'
+        self.clf = joblib.load(f'{models_dir}/placement_classifier{suffix}.pkl')
+        self.reg = joblib.load(f'{models_dir}/salary_regressor{suffix}.pkl')
+        self.encoders = joblib.load(f'{models_dir}/encoders{suffix}.pkl')
+        self.explainer = joblib.load(f'{models_dir}/shap_explainer{suffix}.pkl')
+        print(f"[ScoringEngine] Loaded variant: {self.variant}")
 
         self.features = [
             'course_type', 'institute_tier', 'region', 'cgpa', 'internship_months',
