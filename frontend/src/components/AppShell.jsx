@@ -3,7 +3,7 @@ import { NavLink, useNavigate, Outlet } from 'react-router-dom';
 import {
   LayoutDashboard, Users, BarChart3, BookOpen, LogOut,
   Building2, Settings, Brain, Sun, Moon, Zap,
-  FileText, User as UserIcon, ShieldCheck, Sparkles,
+  FileText, User as UserIcon, ShieldCheck, Sparkles, Archive, Plug, CheckCheck,
 } from 'lucide-react';
 import { useTheme } from '../context/ThemeContext';
 import { useAuth } from '../context/AuthContext';
@@ -62,18 +62,21 @@ export function BrandMark({ size = 42, withWordmark = true, compact = false }) {
 
 // ─── Admin (lender) sidebar nav items ───────────────────────────────
 const ADMIN_NAV = [
-  { path: '/dashboard',  icon: LayoutDashboard, label: 'Dashboard',         iconColor: '#1B2C5E' },
-  { path: '/students',   icon: Users,            label: 'Portfolio',         iconColor: '#1E56C7' },
-  { path: '/heatmap',    icon: BarChart3,        label: 'Heatmap',           iconColor: '#2F6E45' },
-  { path: '/reports',    icon: BookOpen,         label: 'Reports & Drift',   iconColor: '#A5751F' },
-  { path: '/institutes', icon: Building2,        label: 'Institutes',        iconColor: '#1B2C5E' },
-  { path: '/agentic',    icon: Brain,            label: 'AI Agents',         iconColor: '#C2410C' },
-  { path: '/admin',      icon: Settings,         label: 'Admin Panel',       iconColor: '#5E564B' },
+  { path: '/dashboard',   icon: LayoutDashboard, label: 'Dashboard',         iconColor: '#1B2C5E' },
+  { path: '/students',    icon: Users,            label: 'Portfolio',         iconColor: '#1E56C7' },
+  { path: '/heatmap',     icon: BarChart3,        label: 'Heatmap',           iconColor: '#2F6E45' },
+  { path: '/reports',     icon: BookOpen,         label: 'Reports & Drift',   iconColor: '#A5751F' },
+  { path: '/institutes',  icon: Building2,        label: 'Institutes',        iconColor: '#1B2C5E' },
+  { path: '/agentic',     icon: Brain,            label: 'AI Agents',         iconColor: '#C2410C' },
+  { path: '/admin/audit', icon: Archive,          label: 'Audit Log',         iconColor: '#5E564B' },
+  { path: '/admin',       icon: Settings,         label: 'Admin Panel',       iconColor: '#5E564B' },
 ];
 
 const STUDENT_NAV = [
   { path: '/me/dashboard', icon: LayoutDashboard, label: 'My Dashboard',     iconColor: '#1B2C5E' },
   { path: '/me/apply',     icon: FileText,         label: 'My Application',  iconColor: '#C2410C' },
+  { path: '/me/profile',   icon: Plug,             label: 'Linked Profiles', iconColor: '#1E56C7' },
+  { path: '/me/decision',  icon: CheckCheck,       label: 'Loan Decision',   iconColor: '#2F6E45' },
 ];
 
 function Sidebar({ navItems, variant }) {
@@ -108,7 +111,7 @@ function Sidebar({ navItems, variant }) {
           <NavLink
             key={path}
             to={path}
-            end={path === '/dashboard' || path === '/me/dashboard'}
+            end={path === '/dashboard' || path === '/me/dashboard' || path === '/admin'}
             className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
           >
             {({ isActive }) => (

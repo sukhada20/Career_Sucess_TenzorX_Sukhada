@@ -4,6 +4,38 @@ import joblib
 import pandas as pd
 import numpy as np
 
+
+# ─── Profile-Linking Boost ───────────────────────────────────────────────────
+# Each connected external profile lifts the placement-probability prediction by
+# a capped amount. Weights are intentionally conservative (max +15pp total) so
+# the model never over-rewards self-reported signals over the trained features.
+PROFILE_MAX_BOOST_PP = 15.0
+
+def compute_profile_boost(linked_profiles: dict | None) -> tuple[float, list[str]]:
+    """Returns (boost_pp, reasons) where boost_pp ∈ [0, 15] and reasons is a
+    human-readable list of what contributed. linked_profiles shape:
+      { "github":   {"profile_score": 0..100, ...},
+        "linkedin": {"profile_score": 0..100, ...},
+        "naukri":   {"profile_score": 0..100, ...} }
+    Per-provider weights (max contribution): GitHub 8pp, LinkedIn 5pp, Naukri 2pp.
+    """
+    if not linked_profiles:
+        return 0.0, []
+
+    weights = {"github": 8.0, "linkedin": 5.0, "naukri": 2.0}
+    boost = 0.0
+    reasons = []
+    for provider, profile in linked_profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        score = float(profile.get("profile_score", 0))
+        contrib = round(weights.get(provider, 0) * (score / 100.0), 2)
+        if contrib > 0:
+            boost += contrib
+            reasons.append(f"{provider.title()} profile ({int(score)}/100) → +{contrib}pp")
+    boost = min(boost, PROFILE_MAX_BOOST_PP)
+    return round(boost, 2), reasons
+
 # Preference order matches the admin Data Provenance card:
 # `combined` has the salary-scale fix (synthetic ×12 + AMCAT annual) so it must
 # win over the synthetic-only baseline whose salary head is 12× too low.

@@ -11,9 +11,12 @@ import Reports from './pages/Reports';
 import Admin from './pages/Admin';
 import Institutes from './pages/Institutes';
 import AgenticInsights from './pages/AgenticInsights';
+import AuditLog from './pages/AuditLog';
 import LoanApply from './pages/student/LoanApply';
 import PreScreen from './pages/student/PreScreen';
 import StudentDashboard from './pages/student/StudentDashboard';
+import Profile from './pages/student/Profile';
+import Decision from './pages/student/Decision';
 
 import AppShell from './components/AppShell';
 import ProtectedRoute from './components/ProtectedRoute';
@@ -52,6 +55,7 @@ export default function App() {
           <Route path="/institutes"    element={<Institutes />} />
           <Route path="/agentic"       element={<AgenticInsights />} />
           <Route path="/admin"         element={<Admin />} />
+          <Route path="/admin/audit"   element={<AuditLog />} />
         </Route>
 
         {/* Student / borrower (protected, with sidebar shell — student variant) */}
@@ -59,6 +63,8 @@ export default function App() {
           <Route path="/me/apply"      element={<LoanApply />} />
           <Route path="/me/prescreen"  element={<PreScreen />} />
           <Route path="/me/dashboard"  element={<StudentDashboard />} />
+          <Route path="/me/profile"    element={<Profile />} />
+          <Route path="/me/decision"   element={<Decision />} />
         </Route>
 
         {/* Catch-all → role-appropriate home */}

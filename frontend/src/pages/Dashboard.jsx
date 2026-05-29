@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom';
 import axios from 'axios';
 import {
   Users, TrendingUp, AlertTriangle, Activity, Zap,
-  MapPin, BookOpen, Search, RefreshCw, ChevronRight, Brain
+  MapPin, BookOpen, Search, RefreshCw, ChevronRight, Brain,
+  IndianRupee, ShieldAlert, Wallet, TrendingDown,
 } from 'lucide-react';
 import {
   PieChart, Pie, ResponsiveContainer, Tooltip,
@@ -184,8 +185,116 @@ const CustomTooltip = ({ active, payload, label }) => {
   );
 };
 
+// Helper: format INR amount as "₹X.XX Cr" or "₹X.XX L"
+function fmtINR(n) {
+  if (!n || n < 0) return '₹0';
+  if (n >= 1e7) return `₹${(n / 1e7).toFixed(2)} Cr`;
+  if (n >= 1e5) return `₹${(n / 1e5).toFixed(2)} L`;
+  if (n >= 1e3) return `₹${(n / 1e3).toFixed(1)}K`;
+  return `₹${n.toLocaleString('en-IN')}`;
+}
+
+function PortfolioHero({ portfolio }) {
+  if (!portfolio) return null;
+  const atRiskColor = portfolio.at_risk_pct > 20 ? 'var(--risk-high)'
+                    : portfolio.at_risk_pct > 12 ? 'var(--risk-medium)'
+                    : 'var(--risk-low)';
+  return (
+    <>
+      <div className="eyebrow" style={{ marginBottom: '0.85rem', color: 'var(--signal)', marginTop: '1.75rem' }}>
+        <span style={{ marginRight: '0.5em' }}>§ 02 — Portfolio Economics</span>
+      </div>
+      <div className="grid-4 portfolio-hero-grid" style={{ marginBottom: '1.75rem' }}>
+        <StatCard
+          index={0}
+          icon={Wallet} iconClass="stat-icon-blue" accentColor="#1B2C5E"
+          title="Total Disbursed"
+          value={fmtINR(portfolio.total_disbursed_inr)}
+          sub={`${portfolio.total_students?.toLocaleString()} active loans`}
+        />
+        <StatCard
+          index={1}
+          icon={IndianRupee} iconClass="stat-icon-green" accentColor="#2F6E45"
+          title="Assets Under Mgmt"
+          value={fmtINR(portfolio.aum_inr)}
+          sub="~85% of book outstanding"
+        />
+        <StatCard
+          index={2}
+          icon={ShieldAlert} iconClass="stat-icon-red" accentColor={atRiskColor}
+          title="At-Risk Principal"
+          value={fmtINR(portfolio.at_risk_amount_inr)}
+          sub={`${portfolio.at_risk_pct}% of book in HIGH band`}
+        />
+        <StatCard
+          index={3}
+          icon={TrendingDown} iconClass="stat-icon-amber" accentColor="#A5751F"
+          title="Projected Loss · 12M"
+          value={fmtINR(portfolio.projected_loss_inr)}
+          sub={`${portfolio.projected_default_rate_pct}% weighted default rate`}
+        />
+      </div>
+
+      {/* Composition + Top at-risk */}
+      <div className="grid-2" style={{ marginBottom: '1.75rem' }}>
+        <div className="card">
+          <div className="card-title"><MapPin size={13} /> Portfolio by Institute Tier</div>
+          <div style={{ marginTop: '0.75rem' }}>
+            {Object.entries(portfolio.composition?.by_tier || {}).map(([tier, info]) => {
+              const pct = portfolio.total_disbursed_inr > 0 ? (info.amount_inr / portfolio.total_disbursed_inr * 100) : 0;
+              return (
+                <div key={tier} style={{ marginBottom: '0.65rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '0.25rem', fontSize: '0.8rem' }}>
+                    <span style={{ color: 'var(--ink-soft)', fontWeight: 600 }}>Tier {tier}</span>
+                    <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--ink)', fontWeight: 600 }}>
+                      {fmtINR(info.amount_inr)} <span style={{ color: 'var(--ink-faint)', marginLeft: '4px' }}>({info.count?.toLocaleString()})</span>
+                    </span>
+                  </div>
+                  <div className="progress-bar-track" style={{ height: '5px' }}>
+                    <div className="progress-bar-fill" style={{ width: `${pct}%`, background: '#1B2C5E' }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-title"><AlertTriangle size={13} /> Top 5 at-risk loans</div>
+          <div style={{ marginTop: '0.5rem' }}>
+            {(portfolio.top_at_risk_students || []).map((s) => (
+              <Link key={s.student_id} to={`/student/${s.student_id}`} style={{ textDecoration: 'none' }}>
+                <div className="top-risk-row">
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: '0.84rem', color: 'var(--ink)' }}>
+                      {s.student_id}
+                    </div>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--ink-faint)', marginTop: '2px' }}>
+                      {s.course_type} · {s.region} · CGPA {s.cgpa}
+                    </div>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--risk-high)', fontStyle: 'italic', marginTop: '2px' }}>
+                      {s.primary_risk_factor}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                    <div style={{ fontFamily: 'var(--font-mono)', color: 'var(--ink)', fontWeight: 600, fontSize: '0.86rem' }}>
+                      {fmtINR(s.loan_amount_inr)}
+                    </div>
+                    <span className="badge badge-high" style={{ fontSize: '0.65rem', marginTop: '3px' }}>HIGH</span>
+                  </div>
+                </div>
+              </Link>
+            ))}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function Dashboard() {
   const [summary, setSummary] = useState(null);
+  const [portfolio, setPortfolio] = useState(null);
   const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -196,12 +305,14 @@ function Dashboard() {
   const fetchData = async () => {
     setRefreshing(true);
     try {
-      const [sumRes, stuRes] = await Promise.all([
+      const [sumRes, stuRes, pfRes] = await Promise.all([
         axios.get(`${API_BASE}/api/v1/cohort/summary`),
         axios.get(`${API_BASE}/api/v1/students?limit=20`),
+        axios.get(`${API_BASE}/api/v1/portfolio/summary`).catch(() => ({ data: null })),
       ]);
       setSummary(sumRes.data);
       setStudents(stuRes.data);
+      setPortfolio(pfRes.data);
       setError(null);
     } catch {
       setError('Cannot reach backend. Ensure the FastAPI server is running on port 8001.');
@@ -322,6 +433,9 @@ function Dashboard() {
           sub="NBA · Explainability · Market"
         />
       </div>
+
+      {/* Portfolio Economics Hero — disbursed, AUM, at-risk, projected loss */}
+      <PortfolioHero portfolio={portfolio} />
 
       {/* Charts Row */}
       <div className="grid-3" style={{ marginBottom: '1.75rem' }}>

@@ -1,7 +1,28 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { Settings, Shield, Zap, ChevronDown, ChevronUp, Save, RefreshCw, CheckCircle, Users, Database } from 'lucide-react';
+import { Settings, Shield, Zap, ChevronDown, ChevronUp, Save, RefreshCw, CheckCircle, Users, Database, AlertTriangle, TrendingUp } from 'lucide-react';
 import { API_BASE } from '../App';
+
+// Tiny inline sparkline (no external lib) — accepts array of numbers 0..1
+function Sparkline({ data, color = 'var(--ink)', threshold = 0.10, width = 140, height = 32 }) {
+  if (!data || data.length === 0) return null;
+  const max = Math.max(...data, threshold * 1.2);
+  const min = 0;
+  const range = max - min || 1;
+  const stepX = width / (data.length - 1 || 1);
+  const points = data.map((v, i) => `${i * stepX},${height - ((v - min) / range) * height}`).join(' ');
+  const thresholdY = height - ((threshold - min) / range) * height;
+  return (
+    <svg width={width} height={height} style={{ display: 'block' }}>
+      {/* threshold line */}
+      <line x1={0} x2={width} y1={thresholdY} y2={thresholdY} stroke="var(--risk-high)" strokeWidth="1" strokeDasharray="2,3" opacity="0.4" />
+      <polyline points={points} fill="none" stroke={color} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      {data.map((v, i) => (
+        <circle key={i} cx={i * stepX} cy={height - ((v - min) / range) * height} r={i === data.length - 1 ? 3 : 1.5} fill={color} />
+      ))}
+    </svg>
+  );
+}
 
 function ConfigSection({ title, icon: Icon, children, defaultOpen = false }) {
   const [open, setOpen] = useState(defaultOpen);
@@ -47,7 +68,9 @@ function Admin() {
   useEffect(() => {
     axios.get(`${API_BASE}/api/v1/admin/config`).then(r => setConfig(r.data)).catch(() => {});
     axios.get(`${API_BASE}/api/v1/model/champion-challenger`).then(r => setCcData(r.data)).catch(() => {});
-    axios.get(`${API_BASE}/api/v1/model/fairness`).then(r => setFairness(r.data)).catch(() => {});
+    axios.get(`${API_BASE}/api/v1/model/fairness/v2`)
+      .then(r => setFairness(r.data))
+      .catch(() => axios.get(`${API_BASE}/api/v1/model/fairness`).then(r => setFairness(r.data)).catch(() => {}));
     axios.get(`${API_BASE}/api/v1/model/data-provenance`).then(r => setProvenance(r.data)).catch(() => {});
   }, []);
 
@@ -287,30 +310,92 @@ function Admin() {
         </div>
       </ConfigSection>
 
-      {/* Fairness Report */}
+      {/* Fairness Report — v2 with dimension cards + sparkline trends */}
       {fairness && (
         <div className="card">
-          <div className="card-title"><Shield size={14} /> Model Fairness Audit (§16.2)</div>
-          <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '1rem', alignItems: 'center' }}>
+          <div className="card-title"><Shield size={14} /> Model Fairness Audit · v2</div>
+          <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
             <span className={`badge ${fairness.overall_status === 'PASS' ? 'badge-low' : 'badge-high'}`}>
               {fairness.overall_status === 'PASS' ? '✓ Overall PASS' : '⚠ Overall FAIL'}
             </span>
-            <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Audit date: {fairness.audit_date} | Next: {fairness.next_audit}</span>
+            <span style={{ fontSize: '0.78rem', color: 'var(--ink-muted)' }}>Audit date: {fairness.audit_date} · Next: {fairness.next_audit}</span>
+            {fairness.thresholds && (
+              <span style={{ fontSize: '0.74rem', color: 'var(--ink-faint)', fontStyle: 'italic', marginLeft: 'auto' }}>
+                Thresholds: warn {fairness.thresholds.warning_pp}pp · act {fairness.thresholds.action_pp}pp · {fairness.thresholds.framework}
+              </span>
+            )}
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem' }}>
-            {Object.entries(fairness.dimensions || {}).map(([dim, info]) => (
-              <div key={dim} style={{ padding: '0.75rem', borderRadius: '8px', background: info.status === 'PASS' ? 'rgba(16,185,129,0.06)' : 'rgba(239,68,68,0.06)', border: `1px solid ${info.status === 'PASS' ? 'rgba(16,185,129,0.2)' : 'rgba(239,68,68,0.2)'}` }}>
-                <div style={{ fontWeight: 700, fontSize: '0.82rem', color: info.status === 'PASS' ? 'var(--risk-low)' : 'var(--risk-high)', marginBottom: '0.35rem' }}>
-                  {info.status === 'PASS' ? '✓' : '✗'} {dim}
-                </div>
-                <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>Max disparity: <strong>{(info.max_disparity * 100).toFixed(1)}%</strong></div>
-                {info.alert && <div style={{ fontSize: '0.72rem', color: 'var(--risk-high)', marginTop: '0.25rem' }}>⚠ Exceeds 10% threshold. SLA: 30 days.</div>}
+
+          {/* RBI threshold annotation banner */}
+          {fairness.overall_status === 'FAIL' && (
+            <div className="alert-banner" style={{
+              background: 'rgba(168, 40, 40, 0.05)',
+              border: '1px solid rgba(168, 40, 40, 0.2)',
+              borderLeftColor: 'var(--risk-high)',
+              marginBottom: '1rem',
+            }}>
+              <AlertTriangle size={16} color="var(--risk-high)" />
+              <div>
+                <strong style={{ color: 'var(--risk-high)', fontSize: '0.86rem' }}>
+                  One or more dimensions exceed the 10pp action threshold
+                </strong>
+                <p style={{ fontSize: '0.78rem', color: 'var(--ink-soft)', marginTop: '0.2rem', lineHeight: 1.5 }}>
+                  Remediation SLA: 30 days. Escalate to Model Risk Committee before next model promotion.
+                </p>
               </div>
-            ))}
+            </div>
+          )}
+
+          {/* Per-dimension cards (grid, responsive) */}
+          <div className="fairness-grid">
+            {Object.entries(fairness.dimensions || {}).map(([dim, info]) => {
+              const disparityPct = info.max_disparity_pct ?? (info.max_disparity * 100).toFixed(1);
+              const band = info.band || (info.max_disparity >= 0.10 ? 'HIGH' : info.max_disparity >= 0.05 ? 'MEDIUM' : 'LOW');
+              const color = band === 'HIGH' ? 'var(--risk-high)' : band === 'MEDIUM' ? 'var(--risk-medium)' : 'var(--risk-low)';
+              return (
+                <div key={dim} className="fairness-dim-card" style={{ borderTop: `3px solid ${color}` }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.55rem' }}>
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: '0.88rem', color: 'var(--ink)' }}>{dim}</div>
+                      <div style={{ fontSize: '0.72rem', color: 'var(--ink-faint)', marginTop: '2px' }}>
+                        {Object.keys(info.groups || {}).length} groups · {Object.values(info.groups || {}).reduce((a, b) => a + (b?.n || 0), 0).toLocaleString()} students
+                      </div>
+                    </div>
+                    <span className={`badge badge-${band.toLowerCase()}`} style={{ fontSize: '0.7rem' }}>{band}</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.5rem', marginBottom: '0.65rem' }}>
+                    <span style={{ fontFamily: 'var(--font-display)', fontSize: '1.7rem', color, lineHeight: 1, fontWeight: 400, fontFeatureSettings: '"tnum"' }}>
+                      {disparityPct}%
+                    </span>
+                    <span style={{ fontSize: '0.72rem', color: 'var(--ink-faint)' }}>max disparity</span>
+                  </div>
+                  {info.trend_7_periods && (
+                    <div style={{ marginBottom: '0.5rem' }}>
+                      <Sparkline data={info.trend_7_periods} color={color} threshold={0.10} width={180} height={28} />
+                      <div style={{ fontSize: '0.66rem', color: 'var(--ink-faint)', marginTop: '4px', fontFamily: 'var(--font-mono)' }}>
+                        7-period trend · red line = 10pp action threshold
+                      </div>
+                    </div>
+                  )}
+                  {info.remediation_sla_days && (
+                    <div style={{ fontSize: '0.72rem', color: 'var(--risk-high)', marginTop: '0.45rem', fontStyle: 'italic' }}>
+                      ⚠ Remediation SLA: {info.remediation_sla_days} days
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
-          <div style={{ marginTop: '0.75rem', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-            Protected attributes excluded: {fairness.protected_attributes_excluded?.join(', ')}
+
+          <div style={{ marginTop: '0.85rem', fontSize: '0.74rem', color: 'var(--ink-faint)', fontStyle: 'italic' }}>
+            Protected attributes excluded from features: {(fairness.protected_attributes_excluded_from_features || fairness.protected_attributes_excluded || []).join(', ')}
           </div>
+          {fairness.data_note && (
+            <div style={{ marginTop: '0.45rem', fontSize: '0.72rem', color: 'var(--ink-faint)', fontStyle: 'italic' }}>
+              <TrendingUp size={10} style={{ verticalAlign: '-1px', marginRight: '5px' }} />
+              {fairness.data_note}
+            </div>
+          )}
         </div>
       )}
     </div>

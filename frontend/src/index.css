@@ -3016,3 +3016,108 @@ textarea.select-input { padding: 0.7rem 0.9rem; min-height: 84px; }
   .prob-row, .result-meta-grid { grid-template-columns: 1fr; }
   .result-factors { grid-template-columns: 1fr; }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   PHASE 4 — Profile Linking, AI Decisioning, Portfolio KPIs
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Modal backdrop + card ────────────────────────────────────── */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(23, 27, 39, 0.55);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  backdrop-filter: blur(2px);
+}
+.modal-card {
+  max-width: 480px;
+  width: 100%;
+  padding: 1.75rem;
+  background: var(--card-raised);
+  box-shadow: var(--shadow-raised);
+}
+.btn-icon {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--ink-faint);
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: color 0.15s ease;
+}
+.btn-icon:hover { color: var(--ink); background: var(--rule); }
+
+/* ── Profile cards ───────────────────────────────────────────── */
+.profile-card { min-height: 280px; }
+
+/* ── Decision hero ───────────────────────────────────────────── */
+.decision-hero {
+  padding: 1.5rem;
+}
+.decision-score-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+}
+@media (max-width: 720px) {
+  .decision-score-grid { grid-template-columns: 1fr; gap: 1rem; }
+}
+
+/* ── Portfolio hero ──────────────────────────────────────────── */
+.portfolio-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+}
+@media (max-width: 1024px) {
+  .portfolio-hero-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 600px) {
+  .portfolio-hero-grid { grid-template-columns: 1fr; }
+}
+
+/* ── Top at-risk row ─────────────────────────────────────────── */
+.top-risk-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.65rem 0.75rem;
+  border-left: 2px solid var(--risk-high);
+  background: rgba(168, 40, 40, 0.03);
+  margin-bottom: 0.4rem;
+  border-radius: 2px;
+  transition: background 0.15s ease;
+  cursor: pointer;
+}
+.top-risk-row:hover {
+  background: rgba(168, 40, 40, 0.08);
+}
+
+/* ── Fairness dimension grid ─────────────────────────────────── */
+.fairness-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.85rem;
+  margin-top: 0.5rem;
+}
+.fairness-dim-card {
+  background: var(--card);
+  border: 1px solid var(--card-edge);
+  padding: 1rem;
+  border-radius: 2px;
+}
+
+/* ── Audit row hover ─────────────────────────────────────────── */
+.audit-row:hover {
+  background: var(--card-raised);
+}

@@ -2,7 +2,12 @@ import math
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from scoring_engine import ScoringEngine
+from scoring_engine import ScoringEngine, compute_profile_boost
+from profile_fetchers import (
+    fetch_github, github_score,
+    fetch_linkedin, fetch_linkedin_pdl, fetch_linkedin_proxycurl, linkedin_score,
+    fetch_naukri_cohort,
+)
 import pandas as pd
 import numpy as np
 import random
@@ -1582,6 +1587,585 @@ async def ingest_signal(payload: dict = {}):
         "rescore_job_id": f"RSC-{random.randint(10000, 99999)}" if severity in ["HIGH", "CRITICAL"] else None,
         "message": f"Signal ingested. {'Portfolio re-scoring triggered for ' + str(affected_students) + ' students.' if severity in ['HIGH', 'CRITICAL'] else 'Queued for next nightly scoring run.'}",
         "ingested_at": "2026-05-01T09:30:00Z",
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHASE 4 — PROFILE LINKING, AI DECISIONING, PORTFOLIO KPIs
+# ═══════════════════════════════════════════════════════════════
+
+# In-memory profile store (resets on backend restart — fine for demo).
+# Keyed by student_id → { provider → { username, profile_data, profile_score, linked_at } }
+linked_profiles_store: dict[str, dict[str, dict]] = {}
+loan_decisions_store: dict[str, dict] = {}
+
+class ProfileLinkRequest(BaseModel):
+    student_id: str
+    provider: str  # "github" | "linkedin" | "naukri"
+    username: str
+
+class LoanDecisionRequest(BaseModel):
+    student_id: str
+
+
+def _synthesize_github_profile(username: str, h: int) -> tuple[dict, int]:
+    """Deterministic mock of a GitHub profile based on username hash."""
+    repos = 12 + (h % 60)
+    followers = 8 + (h % 240)
+    stars = 25 + (h % 380)
+    contributions_yr = 180 + (h % 700)
+    streak = 4 + (h % 90)
+    top_langs = ["Python", "JavaScript", "TypeScript", "Go", "Rust"][:(1 + (h % 4))]
+    score = min(100, int(20 + repos * 0.5 + min(stars, 200) * 0.15 + min(contributions_yr, 800) * 0.05))
+    return {
+        "username": username,
+        "avatar_url": f"https://github.com/{username}.png",
+        "public_repos": repos,
+        "followers": followers,
+        "stars_earned": stars,
+        "contributions_last_year": contributions_yr,
+        "current_streak_days": streak,
+        "top_languages": top_langs,
+        "profile_url": f"https://github.com/{username}",
+    }, score
+
+
+def _synthesize_linkedin_profile(username: str, h: int, student: dict) -> tuple[dict, int]:
+    """Mock LinkedIn — based on student's existing record so it looks coherent."""
+    course = student.get("course_type", "Engineering")
+    region = student.get("region", "Bengaluru")
+    headlines = {
+        "Engineering": f"CS student @ {student.get('institute_tier', 'B')}-tier institute · Open to SDE/Analyst roles",
+        "MBA": f"MBA Finance candidate · Interested in IB / Equity Research / Corporate Finance",
+        "Nursing": f"BSc Nursing · ACLS-certified · Seeking critical-care positions",
+    }
+    connections = 80 + (h % 480)
+    endorsements = 5 + (h % 35)
+    skills = {
+        "Engineering": ["Python", "Data Structures", "SQL", "REST APIs", "Git"],
+        "MBA": ["Financial Modeling", "Excel", "Equity Research", "DCF Valuation", "PowerPoint"],
+        "Nursing": ["Patient Care", "ACLS", "Triage", "EMR Systems", "Critical Care"],
+    }.get(course, ["Communication", "Teamwork", "Problem Solving"])
+    completeness = min(100, 55 + (h % 40))
+    score = min(100, int(completeness * 0.5 + min(connections, 500) * 0.06 + endorsements * 0.4))
+    return {
+        "username": username,
+        "headline": headlines.get(course, f"{course} student in {region}"),
+        "connections": connections,
+        "endorsements": endorsements,
+        "profile_completeness_pct": completeness,
+        "top_skills": skills,
+        "open_to_work": True,
+        "profile_url": f"https://linkedin.com/in/{username}",
+        "_note": "Simulated profile data — real LinkedIn API limited to name+headline since 2018",
+    }, score
+
+
+def _synthesize_naukri_profile(username: str, h: int, student: dict) -> tuple[dict, int]:
+    """Mock Naukri job-board activity."""
+    applications = 8 + (h % 45)
+    recruiter_views = 12 + (h % 90)
+    callbacks = max(1, int(applications * 0.18))
+    profile_views_30d = 20 + (h % 120)
+    score = min(100, int(applications * 1.2 + recruiter_views * 0.25 + callbacks * 4))
+    return {
+        "username": username,
+        "applications_30d": applications,
+        "recruiter_views_30d": recruiter_views,
+        "callbacks_30d": callbacks,
+        "profile_views_30d": profile_views_30d,
+        "resume_visibility": "Public to recruiters",
+        "preferred_roles": ["Software Engineer", "Data Analyst"] if student.get("course_type") == "Engineering" else ["Associate", "Analyst"],
+        "_note": "Simulated profile data — Naukri has no public API for individual borrower activity",
+    }, score
+
+
+@app.post("/api/v1/profile/link")
+async def link_profile(req: ProfileLinkRequest):
+    """Mock OAuth completion for GitHub/LinkedIn/Naukri. Stores synthesized profile
+    data + score in memory. Real OAuth is out of scope for demo (LinkedIn deprecated
+    profile-data API in 2018; Naukri has no public API)."""
+    provider = req.provider.lower()
+    if provider not in ("github", "linkedin", "naukri"):
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+
+    student = next((s for s in mock_db if s.get("student_id") == req.student_id), None) or {
+        "student_id": req.student_id, "course_type": "Engineering", "region": "Bengaluru", "institute_tier": "B",
+    }
+    h = _stable_hash(req.student_id, provider, req.username)
+    live_data = False  # True only when real-API fetch succeeded with meaningful data
+
+    if provider == "github":
+        real = fetch_github(req.username)
+        if real:
+            profile_data, score = real, github_score(real)
+            live_data = True
+        else:
+            profile_data, score = _synthesize_github_profile(req.username, h)
+            profile_data["_source"] = "Simulated · GitHub user not found or API rate-limited"
+
+    elif provider == "linkedin":
+        # Priority chain: PDL (rich, free 100 credits) → Proxycurl (rich, free 10 credits)
+        # → public-page OG probe (free, usually bot-blocked) → synthesizer fallback
+        real = fetch_linkedin_pdl(req.username) or fetch_linkedin_proxycurl(req.username) or fetch_linkedin(req.username)
+        # If the fetcher gave us meaningful data (name OR headline OR avatar OR experience), call it live
+        has_real_data = bool(real and (real.get("name") or real.get("headline") or real.get("avatar_url") or real.get("experience_count")))
+        if has_real_data:
+            # Merge real signals on top of a synthesized base so all card fields render
+            base, base_score = _synthesize_linkedin_profile(req.username, h, student)
+            profile_data = {**base, **{k: v for k, v in real.items() if v is not None}}
+            score = max(linkedin_score(real), base_score)
+            live_data = True
+        else:
+            profile_data, score = _synthesize_linkedin_profile(req.username, h, student)
+            # Carry probe result so UI can show "URL verified" if reachable
+            if real:
+                profile_data["url_reachable"] = real.get("url_reachable", False)
+                profile_data["http_status"] = real.get("http_status")
+            profile_data["_source"] = (
+                real.get("_source") if real else
+                "Simulated · set PDL_API_KEY or PROXYCURL_API_KEY in backend/.env for real LinkedIn data"
+            )
+
+    else:  # naukri
+        # Per-borrower activity (apps, recruiter views) is NOT fetchable — stays simulated.
+        # But we enrich with a REAL cohort-level job-market signal from Adzuna India.
+        profile_data, score = _synthesize_naukri_profile(req.username, h, student)
+        cohort = fetch_naukri_cohort(student.get("course_type", "Engineering"), student.get("region", "Bengaluru"))
+        if cohort:
+            profile_data["cohort_signal"] = cohort
+            profile_data["_source"] = "Hybrid · Adzuna India for cohort job-market · borrower activity simulated (Naukri has no public per-user API)"
+            live_data = True  # cohort signal is real even if per-user is synthetic
+        else:
+            profile_data["_source"] = "Simulated · Naukri has no public per-user API · configure ADZUNA_APP_ID/KEY in .env to add live cohort signal"
+
+    from datetime import datetime, timezone
+    entry = {
+        "provider": provider,
+        "username": req.username,
+        "profile_data": profile_data,
+        "profile_score": score,
+        "live_data": live_data,
+        "source_label": profile_data.get("_source", ""),
+        "linked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    linked_profiles_store.setdefault(req.student_id, {})[provider] = entry
+    return sanitize(entry)
+
+
+@app.delete("/api/v1/profile/{student_id}/{provider}")
+async def unlink_profile(student_id: str, provider: str):
+    """Disconnect a linked profile."""
+    if student_id in linked_profiles_store and provider in linked_profiles_store[student_id]:
+        del linked_profiles_store[student_id][provider]
+        return {"status": "unlinked", "provider": provider}
+    raise HTTPException(status_code=404, detail="Profile not linked")
+
+
+@app.get("/api/v1/profile/{student_id}")
+async def get_linked_profiles(student_id: str):
+    """Returns all linked profiles for a student + aggregate boost score."""
+    profiles = linked_profiles_store.get(student_id, {})
+    boost_pp, reasons = compute_profile_boost(profiles)
+    return sanitize({
+        "student_id": student_id,
+        "linked_profiles": profiles,
+        "providers_linked": list(profiles.keys()),
+        "aggregate_boost_pp": boost_pp,
+        "boost_reasons": reasons,
+        "max_possible_boost_pp": 15.0,
+    })
+
+
+@app.post("/api/v1/loan/decide")
+async def decide_loan(req: LoanDecisionRequest):
+    """Final AI loan decisioning — advisory APPROVE/CONDITIONAL/DENY combining
+    prescreen risk + grades + college + linked profile boost. NEVER auto-denies
+    purely on placement risk — always provides a manual-review escalation path.
+    """
+    # Need a recent prescreen to decide on. For a demo, also accept students from mock_db.
+    student = next((s for s in mock_db if s.get("student_id") == req.student_id), None)
+
+    if not student:
+        # No record in mock_db — return a neutral CONDITIONAL with explanation.
+        return sanitize({
+            "decision": "CONDITIONAL",
+            "decision_reasons": [
+                "No prior application found on file for this borrower",
+                "Complete the loan prescreen first so the model has features to score against",
+            ],
+            "adjusted_risk_band": "MEDIUM",
+            "adjusted_placement_6m": None,
+            "profile_boost_applied_pp": 0,
+            "profile_boost_reasons": [],
+            "final_offer": None,
+            "fairness_note": "Decision is advisory; final underwriting includes co-borrower review and is never based solely on placement-risk prediction.",
+        })
+
+    # Build a scoring dict from the mock student record
+    scoring_input = {
+        "student_id":                  student.get("student_id"),
+        "course_type":                 student.get("course_type", "Engineering"),
+        "institute_tier":              student.get("institute_tier", "B"),
+        "region":                      student.get("region", "Bengaluru"),
+        "cgpa":                        float(student.get("cgpa", 7.0)),
+        "internship_months":           int(student.get("internship_months", 0)),
+        "employer_tier":               student.get("employer_tier", "Startup"),
+        "iqi":                         float(student.get("iqi", 0.3)),
+        "behavioral_activity_score":   int(student.get("behavioral_activity_score", 50)),
+        "field_demand_score":          float(student.get("field_demand_score", 65)),
+        "macro_climate_index":         float(student.get("macro_climate_index", 0.7)),
+        "monthly_emi":                 int(student.get("monthly_emi", 15000)),
+    }
+
+    try:
+        score = engine.score_student(scoring_input)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scoring error: {e}")
+
+    pred = score.get("prediction", {})
+    insights = score.get("insights", {})
+    base_p6m = pred.get("placement_probability", {}).get("6m", 0.5)
+    risk_band = pred.get("risk_band", "MEDIUM")
+    emi_comfort = insights.get("emi_comfort_index", 0.0)
+    cgpa = scoring_input["cgpa"]
+
+    # Profile boost
+    profiles = linked_profiles_store.get(req.student_id, {})
+    boost_pp, boost_reasons = compute_profile_boost(profiles)
+    adjusted_p6m = round(min(1.0, base_p6m + boost_pp / 100.0), 3)
+
+    # Recompute adjusted risk band with boosted probability
+    if adjusted_p6m >= 0.70:
+        adjusted_band = "LOW"
+    elif adjusted_p6m >= 0.45:
+        adjusted_band = "MEDIUM"
+    else:
+        adjusted_band = "HIGH"
+    # Hard overrides still apply
+    if emi_comfort < 1.0 and emi_comfort != 99.0:
+        adjusted_band = "HIGH"
+
+    # Decision logic
+    reasons = []
+    if adjusted_band == "LOW" and emi_comfort >= 2.0 and len(profiles) >= 1:
+        decision = "APPROVE"
+        reasons.append(f"Low placement risk: {int(adjusted_p6m*100)}% probability at 6 months")
+        reasons.append(f"Healthy EMI comfort: {emi_comfort:.1f}× monthly salary covers EMI")
+        reasons.append(f"{len(profiles)} external profile(s) linked, lifting score by {boost_pp}pp")
+    elif adjusted_band == "HIGH" and emi_comfort < 1.0 and cgpa < 6.0:
+        decision = "DENY"
+        reasons.append(f"High placement risk: only {int(adjusted_p6m*100)}% probability at 6 months")
+        reasons.append(f"EMI comfort {emi_comfort:.1f}× is below 1.0× — projected salary won't cover EMI")
+        reasons.append(f"CGPA {cgpa:.2f} below safe-threshold of 6.0")
+        reasons.append("Manual underwriting review available — co-borrower income may change outcome")
+    else:
+        decision = "CONDITIONAL"
+        if adjusted_band == "MEDIUM":
+            reasons.append(f"Medium placement risk: {int(adjusted_p6m*100)}% probability — meets approval floor")
+        elif adjusted_band == "HIGH":
+            reasons.append(f"Elevated placement risk: {int(adjusted_p6m*100)}% probability")
+        if emi_comfort < 2.0 and emi_comfort >= 1.0:
+            reasons.append(f"Tight EMI comfort {emi_comfort:.1f}× — co-borrower endorsement recommended")
+        if len(profiles) == 0:
+            reasons.append("No external profiles linked — connect GitHub/LinkedIn/Naukri to strengthen application")
+        if cgpa < 7.0 and cgpa >= 6.0:
+            reasons.append(f"CGPA {cgpa:.2f} is in the borderline band — recent semester grades will be reviewed")
+
+    # Final offer terms
+    base_loan = scoring_input["monthly_emi"] * 60  # approximate principal from EMI
+    rate_band = {
+        "APPROVE":     {"min": 9.5,  "max": 11.0, "sanctioned_pct": 1.00, "tenure_years": 7},
+        "CONDITIONAL": {"min": 11.0, "max": 13.0, "sanctioned_pct": 0.85, "tenure_years": 7},
+        "DENY":        {"min": 13.5, "max": 15.5, "sanctioned_pct": 0.60, "tenure_years": 5},
+    }[decision]
+
+    conditions = ["EMI auto-debit consent required", "Quarterly placement-progress check-in"]
+    if decision == "CONDITIONAL":
+        conditions.append("Co-borrower guarantor required")
+        conditions.append("Placement update every 60 days for first 12 months")
+    if decision == "DENY":
+        conditions = ["Application requires manual underwriter review", "Schedule a branch visit to discuss alternative structures"]
+
+    final_offer = {
+        "status": decision,
+        "sanctioned_amount_inr": int(base_loan * rate_band["sanctioned_pct"]),
+        "interest_rate_band_pct": {"min": rate_band["min"], "max": rate_band["max"]},
+        "tenure_years": rate_band["tenure_years"],
+        "conditions": conditions,
+    }
+
+    decision_pkg = {
+        "decision": decision,
+        "decision_reasons": reasons,
+        "base_placement_6m": round(base_p6m, 3),
+        "adjusted_placement_6m": adjusted_p6m,
+        "adjusted_risk_band": adjusted_band,
+        "base_risk_band": risk_band,
+        "emi_comfort_index": emi_comfort,
+        "cgpa": cgpa,
+        "profile_boost_applied_pp": boost_pp,
+        "profile_boost_reasons": boost_reasons,
+        "providers_linked": list(profiles.keys()),
+        "final_offer": final_offer,
+        "fairness_note": (
+            "This decision is advisory. Final underwriting always includes co-borrower review, "
+            "manual override path, and is never based solely on placement-risk prediction. "
+            "Borrowers can request manual review at any time."
+        ),
+    }
+
+    # ─── Cold-start handling (Architect Review item) ─────────────
+    # Mark borrowers with very thin data signals as cold-start; cap risk band
+    # at MEDIUM (never HIGH from cohort priors alone — fairness/self-fulfilling
+    # prophecy risk) and surface LOW confidence to the UI for explicit handling.
+    cold_start = (
+        int(scoring_input.get("internship_months", 0)) == 0
+        and int(scoring_input.get("behavioral_activity_score", 50)) < 25
+        and float(scoring_input.get("iqi", 0)) < 0.10
+        and len(profiles) == 0
+    )
+    if cold_start:
+        # Cap risk band at MEDIUM regardless of model output
+        if decision_pkg["adjusted_risk_band"] == "HIGH":
+            decision_pkg["adjusted_risk_band"] = "MEDIUM"
+            decision_pkg["decision_reasons"].insert(
+                0,
+                "Cold-start borrower: risk band capped at MEDIUM (cohort-prior predictions "
+                "are not used for HIGH-risk decisions — fairness guardrail)"
+            )
+        decision_pkg["cold_start"] = True
+        decision_pkg["confidence_band"] = "LOW"
+        decision_pkg["confidence_note"] = (
+            "Limited data available — prediction relies heavily on cohort priors. "
+            "Connect external profiles or complete a placement-progress update to sharpen the score."
+        )
+    else:
+        decision_pkg["cold_start"] = False
+        decision_pkg["confidence_band"] = (
+            "HIGH" if len(profiles) >= 2 else "MEDIUM" if len(profiles) >= 1 else "MEDIUM"
+        )
+
+    # ─── Audit log entry (Architect Review item) ─────────────────
+    # Capture immutable decision record per RBI IT Framework + DPDP record-keeping.
+    # In production: write to S3 Glacier / OpenSearch with 7-year retention.
+    from datetime import datetime, timezone, timedelta
+    decision_pkg["audit"] = {
+        "decision_id": f"DEC-{_stable_hash(req.student_id, str(int(datetime.now().timestamp()))) % 1000000:06d}",
+        "model_version": "2.0.0-prototype-combined",
+        "decided_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "retained_until_utc": (datetime.now(timezone.utc) + timedelta(days=365 * 7)).isoformat(timespec="seconds"),
+        "feature_snapshot": {k: v for k, v in scoring_input.items() if k != "student_id"},
+        "top_shap_drivers": [
+            {"feature": d["feature"], "shap_value": d["shap_value"], "impact": d["impact_direction"]}
+            for d in score.get("explainability", {}).get("top_drivers", [])
+        ],
+        "compliance_basis": "RBI IT Framework Master Direction · DPDP Section 11 (right to explanation)",
+    }
+
+    loan_decisions_store[req.student_id] = decision_pkg
+    return sanitize(decision_pkg)
+
+
+@app.get("/api/v1/audit/decisions")
+async def list_audit_decisions(limit: int = 20):
+    """Decision audit log — returns recent stored decisions with full feature
+    snapshot, model version, SHAP drivers, and retention timestamp.
+    In production: replace in-memory store with immutable log (OpenSearch + Glacier)."""
+    decisions = list(loan_decisions_store.values())
+    # Sort by decided_at_utc desc (newest first)
+    decisions.sort(key=lambda d: d.get("audit", {}).get("decided_at_utc", ""), reverse=True)
+    return sanitize({
+        "total_decisions_logged": len(decisions),
+        "decisions": decisions[:limit],
+        "retention_policy": "7 years (RBI IT Framework + DPDP record-keeping)",
+        "storage_note": "In-memory for demo. Production target: immutable OpenSearch index + S3 Glacier archive.",
+    })
+
+
+# ─── Portfolio KPIs ──────────────────────────────────────────
+
+_portfolio_cache = {"ts": 0.0, "data": None}
+
+@app.get("/api/v1/portfolio/summary")
+async def portfolio_summary():
+    """Aggregate portfolio KPIs across the loan book — disbursed total, AUM,
+    at-risk principal, projected loss, and composition by tier/region/course.
+    Cached for 60s since the underlying mock_db is static."""
+    import time
+    now = time.time()
+    if _portfolio_cache["data"] and (now - _portfolio_cache["ts"] < 60):
+        return _portfolio_cache["data"]
+
+    if not mock_db:
+        return {"status": "no data", "total_students": 0}
+
+    df = pd.DataFrame(mock_db)
+    # Synthesize loan_amount from monthly_emi (approx 60× for 7-yr loan @ ~11%)
+    if "loan_amount" not in df.columns:
+        emi = pd.to_numeric(df.get("monthly_emi", pd.Series(15000, index=df.index)), errors="coerce").fillna(15000)
+        df["loan_amount"] = (emi * 60).astype(int)
+
+    # Risk-band proxy from placed_6m + cgpa (mock_db doesn't store risk_band directly)
+    def _risk_proxy(row):
+        cgpa = float(row.get("cgpa", 7) or 7)
+        placed = row.get("placed_6m", 1)
+        if placed == 0 and cgpa < 6.0:
+            return "HIGH"
+        if placed == 0:
+            return "MEDIUM"
+        return "LOW"
+    df["_risk_band"] = df.apply(_risk_proxy, axis=1)
+
+    total_disbursed = int(df["loan_amount"].sum())
+    aum_inr = int(total_disbursed * 0.85)  # ~85% outstanding (mock assumption)
+    at_risk = int(df[df["_risk_band"] == "HIGH"]["loan_amount"].sum())
+    medium_risk = int(df[df["_risk_band"] == "MEDIUM"]["loan_amount"].sum())
+    at_risk_pct = round(at_risk / total_disbursed * 100, 1) if total_disbursed > 0 else 0.0
+
+    # Weighted projected default rate: HIGH→18%, MEDIUM→6%, LOW→1.5%
+    counts = df["_risk_band"].value_counts().to_dict()
+    n = len(df)
+    proj_default = round((counts.get("HIGH", 0) * 0.18 + counts.get("MEDIUM", 0) * 0.06 + counts.get("LOW", 0) * 0.015) / n * 100, 2) if n else 0.0
+    projected_loss = int(at_risk * 0.18 + medium_risk * 0.06)
+
+    def _by_dim(col: str) -> dict:
+        result = {}
+        for val, grp in df.groupby(col):
+            result[str(val)] = {
+                "count": int(len(grp)),
+                "amount_inr": int(grp["loan_amount"].sum()),
+            }
+        return dict(sorted(result.items(), key=lambda kv: -kv[1]["amount_inr"]))
+
+    # Top at-risk students (highest loan_amount in HIGH band)
+    high_df = df[df["_risk_band"] == "HIGH"].nlargest(5, "loan_amount")
+    top_at_risk = []
+    for _, row in high_df.iterrows():
+        # Try to identify primary risk factor
+        if float(row.get("cgpa", 7)) < 6.0:
+            factor = f"Low CGPA ({float(row['cgpa']):.2f})"
+        elif int(row.get("internship_months", 0)) == 0:
+            factor = "Zero internship experience"
+        elif float(row.get("behavioral_activity_score", 50)) < 40:
+            factor = "Low portal activity"
+        else:
+            factor = "Weak placement signals"
+        top_at_risk.append({
+            "student_id": row["student_id"],
+            "course_type": row.get("course_type", "—"),
+            "region": row.get("region", "—"),
+            "loan_amount_inr": int(row["loan_amount"]),
+            "risk_band": "HIGH",
+            "primary_risk_factor": factor,
+            "cgpa": round(float(row.get("cgpa", 0)), 2),
+        })
+
+    # Placement velocity (mirrors cohort/summary endpoint)
+    velocity = {
+        "3m":  round(float(df.get("placed_3m",  pd.Series(0)).mean()) * 100, 1),
+        "6m":  round(float(df.get("placed_6m",  pd.Series(0)).mean()) * 100, 1),
+        "12m": round(float(df.get("placed_12m", pd.Series(0)).mean()) * 100, 1),
+    }
+
+    payload = sanitize({
+        "total_students": int(n),
+        "total_disbursed_inr": total_disbursed,
+        "aum_inr": aum_inr,
+        "at_risk_amount_inr": at_risk,
+        "at_risk_pct": at_risk_pct,
+        "projected_default_rate_pct": proj_default,
+        "projected_loss_inr": projected_loss,
+        "risk_band_counts": {k: int(v) for k, v in counts.items()},
+        "composition": {
+            "by_tier":   _by_dim("institute_tier"),
+            "by_region": _by_dim("region"),
+            "by_course": _by_dim("course_type"),
+        },
+        "placement_velocity": velocity,
+        "top_at_risk_students": top_at_risk,
+        "as_of": "2026-05-29T00:00:00Z",
+    })
+    _portfolio_cache["data"] = payload
+    _portfolio_cache["ts"] = now
+    return payload
+
+
+# ─── Enhanced Fairness (gender dim + 6-month trend) ──────────
+
+def _synth_gender(student_id: str) -> str:
+    """Deterministic gender assignment from student_id hash for demo only.
+    NEVER do this in production — gender must come from explicit borrower disclosure."""
+    return "Female" if _stable_hash(student_id, "gender") % 2 == 0 else "Male"
+
+@app.get("/api/v1/model/fairness/v2")
+async def get_fairness_v2():
+    """Enhanced fairness audit — adds a Gender dimension (synthesized for demo)
+    and a 6-month historical trend per dimension. RBI threshold annotations included.
+    """
+    if not mock_db:
+        return {"status": "no data"}
+
+    df = pd.DataFrame(mock_db)
+    df["_gender"] = df["student_id"].apply(_synth_gender)
+
+    DIMENSIONS = [
+        ("Region", "region"),
+        ("Course", "course_type"),
+        ("Institute Tier", "institute_tier"),
+        ("Gender", "_gender"),
+    ]
+
+    def _band(disparity: float) -> str:
+        if disparity >= 0.10:
+            return "HIGH"
+        if disparity >= 0.05:
+            return "MEDIUM"
+        return "LOW"
+
+    report = {}
+    for dim, col in DIMENSIONS:
+        groups = {}
+        for val, grp in df.groupby(col):
+            placed = float(grp["placed_6m"].mean()) if "placed_6m" in grp else 0.5
+            groups[str(val)] = {"placement_rate": round(placed, 3), "n": int(len(grp))}
+        rates = [g["placement_rate"] for g in groups.values()]
+        disparity = round(max(rates) - min(rates), 3) if rates else 0.0
+
+        # Mock 6-month trend (deterministic per dim)
+        seed = _stable_hash(dim, "trend")
+        trend = []
+        for i in range(6):
+            month = (seed + i * 7919) % 100
+            # Generate values that drift around current disparity
+            mock_val = round(max(0, disparity + (month - 50) / 500), 3)
+            trend.append(mock_val)
+        trend.append(disparity)  # current point at the end
+
+        report[dim] = {
+            "groups": groups,
+            "max_disparity": disparity,
+            "max_disparity_pct": round(disparity * 100, 1),
+            "band": _band(disparity),
+            "status": "PASS" if disparity < 0.10 else "FAIL",
+            "trend_7_periods": trend,
+            "remediation_sla_days": 30 if disparity >= 0.10 else None,
+        }
+
+    overall_status = "PASS" if all(v["status"] == "PASS" for v in report.values()) else "FAIL"
+    return sanitize({
+        "audit_date": "2026-05-29",
+        "next_audit": "2026-06-29",
+        "overall_status": overall_status,
+        "dimensions": report,
+        "thresholds": {
+            "warning_pp": 5.0,
+            "action_pp":  10.0,
+            "framework":  "RBI Fair Practices Code · DPDP Section 11",
+        },
+        "protected_attributes_excluded_from_features": ["gender", "caste", "religion", "region_of_birth"],
+        "data_note": "Gender dimension synthesized deterministically from student_id for demo only. "
+                     "In production, gender comes from explicit borrower disclosure (DPDP-compliant).",
     })
 
 

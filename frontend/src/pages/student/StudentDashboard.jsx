@@ -1,16 +1,27 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'motion/react';
+import axios from 'axios';
 import {
   Shield, Briefcase, Sparkles, Handshake, IndianRupee,
   Award, MessageSquare, FileText, CheckCircle2, ArrowRight, FilePen,
+  Plug, CheckCheck,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
+import { API_BASE } from '../../App';
 
 export default function StudentDashboard() {
   const { user } = useAuth();
   const result = user?.lastPrescreen;
   const application = user?.lastApplication;
+  const [profileAgg, setProfileAgg] = useState(null);
+
+  useEffect(() => {
+    if (!user?.studentId) return;
+    axios.get(`${API_BASE}/api/v1/profile/${user.studentId}`)
+      .then(r => setProfileAgg(r.data))
+      .catch(() => {});
+  }, [user?.studentId]);
 
   // No application yet → route to apply
   if (!result) {
@@ -113,6 +124,34 @@ export default function StudentDashboard() {
             <div className="stat-sub">{k.sub}</div>
           </motion.div>
         ))}
+      </div>
+
+      {/* Linked profiles + Final decision CTA */}
+      <div className="card" style={{ marginBottom: '1.5rem', borderLeft: '3px solid var(--signal)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem', flexWrap: 'wrap' }}>
+          <div>
+            <div className="card-title" style={{ marginBottom: '0.3rem' }}><Plug size={13} /> Linked external profiles</div>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.5rem' }}>
+              <span style={{ fontFamily: 'var(--font-display)', fontSize: '1.8rem', color: 'var(--signal)', lineHeight: 1, fontWeight: 400, fontFeatureSettings: '"tnum"' }}>
+                {profileAgg?.providers_linked?.length || 0}<span style={{ fontSize: '0.78rem', color: 'var(--ink-faint)', marginLeft: '4px' }}>/3</span>
+              </span>
+              {profileAgg?.aggregate_boost_pp > 0 && (
+                <span style={{ fontSize: '0.82rem', color: 'var(--risk-low)' }}>
+                  +{profileAgg.aggregate_boost_pp}pp boost
+                </span>
+              )}
+            </div>
+            <div style={{ fontSize: '0.74rem', color: 'var(--ink-faint)', marginTop: '0.2rem' }}>
+              {profileAgg?.providers_linked?.length > 0
+                ? profileAgg.providers_linked.join(' · ')
+                : 'Connect GitHub, LinkedIn, Naukri to strengthen your application'}
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center' }}>
+          <Link to="/me/profile" className="btn btn-ghost"><Plug size={13} /> Manage profiles</Link>
+          <Link to="/me/decision" className="btn btn-primary"><CheckCheck size={13} /> Get Final Decision</Link>
+        </div>
       </div>
 
       {/* Career readiness — reuses the same signals as the lender view */}
